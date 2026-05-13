@@ -4,9 +4,13 @@ on:
   workflow_call:
     inputs:
       runs-on:
-        description: 'Runner label (e.g. ubuntu-latest, self-hosted)'
+        description: |
+          Runner label. WICHTIG: für ARC scale-set runners IMMER den scale-set-Namen
+          verwenden (z. B. 'cloud-dev-environment'). 'self-hosted' funktioniert NUR
+          fuer klassische VM-basierte Self-Hosted-Runner — ARC scale-set runners
+          haben dieses Label by design NICHT (actions/actions-runner-controller#3330).
         type: string
-        default: 'self-hosted'
+        required: true
       claude-args:
         description: 'Additional CLI arguments for claude-code (e.g. --model claude-sonnet-4-6)'
         type: string

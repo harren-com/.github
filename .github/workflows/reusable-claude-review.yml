@@ -55,6 +55,18 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Clean .claude/ symlinks (defensive — avoid ENOENT in action restore-step)
+        # ARC scale-set runner pods can reuse the _work directory between jobs in the
+        # same pod lifecycle. If a previous job left .claude/ symlinks pointing to absolute
+        # paths from a developer machine (~/shared-claude-rules/...), the claude-code-action's
+        # "Restoring .claude from origin/main (PR head is untrusted)" phase calls statx on the
+        # symlink targets, fails with ENOENT, and exits before Claude even starts.
+        # See HendrikHarren/ibkr_to_datev#573.
+        run: |
+          if [ -d .claude ]; then
+            find .claude -type l -delete 2>/dev/null || true
+          fi
+
       - name: Run Claude Code Review
         uses: anthropics/claude-code-action@v1
         env:

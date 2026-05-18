@@ -39,12 +39,21 @@ jobs:
 
     steps:
       - name: Install dependencies
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Install gh CLI to user-local bin if not available
+          # Install gh CLI to user-local bin if not available.
+          # api.github.com gibt unauthenticated nur 60 calls/h pro IP — ARC scale-set pods
+          # teilen Node-IP, daher häufig rate-limited bei vielen Workflow-Runs. Authenticated
+          # mit GITHUB_TOKEN: 5000/h. Plus hardcoded Fallback wenn API doch failt.
           if ! command -v gh &>/dev/null; then
-            GH_VERSION=$(curl -sL https://api.github.com/repos/cli/cli/releases/latest | grep '"tag_name"' | head -1 | sed 's/.*"v\(.*\)".*/\1/')
+            GH_VERSION=$(curl -sL -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+              https://api.github.com/repos/cli/cli/releases/latest \
+              | grep '"tag_name"' | head -1 | sed 's/.*"v\(.*\)".*/\1/')
+            GH_VERSION=${GH_VERSION:-2.65.0}
+            echo "Installing gh CLI v${GH_VERSION}"
             mkdir -p "$HOME/.local/bin"
-            curl -sL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" | tar xz -C /tmp
+            curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" | tar xz -C /tmp
             cp "/tmp/gh_${GH_VERSION}_linux_amd64/bin/gh" "$HOME/.local/bin/gh"
             chmod +x "$HOME/.local/bin/gh"
             echo "$HOME/.local/bin" >> $GITHUB_PATH

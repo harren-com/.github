@@ -57,6 +57,15 @@ jobs:
 
       - name: Run Claude Code Review
         uses: anthropics/claude-code-action@v1
+        env:
+          # claude-code-action v2.1+ installiert bubblewrap (bwrap) für Subprocess-Isolation
+          # und versucht AppArmor-Restriction via sysctl zu deaktivieren. Im ARC-K8s-Runner
+          # ist /proc/sys/ read-only → sysctl schlägt fehl → bwrap kann keine User-Namespaces
+          # erstellen → alle Bash-Subprozesse (inkl. `gh pr comment`) schlagen fehl.
+          # Fix: Subprocess-Scrubbing deaktivieren (offizieller Opt-out). Claude läuft dann
+          # ohne bwrap-Sandbox direkt im Runner-Prozess — akzeptabel, da der ARC-Pod selbst
+          # bereits eine isolierte Sandbox ist (ephemeral, kein Zugriff auf Host).
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '0'
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}

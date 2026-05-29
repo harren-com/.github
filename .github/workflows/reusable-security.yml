@@ -23,7 +23,7 @@ on:
 jobs:
   python-security:
     name: Python Security Scan
-    runs-on: self-hosted
+    runs-on: shared-runners
     timeout-minutes: 10
 
     steps:
@@ -76,7 +76,7 @@ jobs:
 
   secrets-scan:
     name: Secrets Scanning
-    runs-on: self-hosted
+    runs-on: shared-runners
     timeout-minutes: 10
 
     steps:
@@ -103,7 +103,7 @@ jobs:
 
   security-summary:
     name: Security Scan Summary
-    runs-on: self-hosted
+    runs-on: shared-runners
     needs: [python-security, secrets-scan]
     if: always()
 

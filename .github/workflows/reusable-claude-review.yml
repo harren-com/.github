@@ -6,9 +6,10 @@ on:
       runs-on:
         description: |
           Runner label. WICHTIG: für ARC scale-set runners IMMER den scale-set-Namen
-          verwenden (z. B. 'cloud-dev-environment'). 'self-hosted' funktioniert NUR
-          fuer klassische VM-basierte Self-Hosted-Runner — ARC scale-set runners
-          haben dieses Label by design NICHT (actions/actions-runner-controller#3330).
+          verwenden (org-weit 'shared-runners' seit der Org-Migration #234).
+          'self-hosted' funktioniert NUR für klassische VM-basierte Self-Hosted-Runner —
+          ARC scale-set runners haben dieses Label by design NICHT
+          (actions/actions-runner-controller#3330).
         type: string
         required: true
       claude-args:
@@ -115,8 +116,12 @@ jobs:
             (kein Follow-up-Issue). Trivial mitnehmen oder fallenlassen.
 
           ## Bestimme zuerst die Review-Runde
-          Lies deine eigenen, bereits auf diesem PR vorhandenen Review-Comments ein
-          (`gh pr view <PR> --comments` bzw. `gh api repos/<repo>/pulls/<PR>/comments`).
+          Die PR-Nummer steht in `$GITHUB_REF` (Format `refs/pull/<N>/merge` → extrahiere `<N>`),
+          das Repo in `$GITHUB_REPOSITORY` (`owner/repo`). Verlasse dich NICHT auf `gh pr view`
+          ohne Argument — der Checkout ist ein Detached-HEAD-Merge-Ref ohne Branch.
+          Lies damit deine eigenen, bereits auf diesem PR vorhandenen Review-Comments ein
+          (`gh pr view "$N" --repo "$GITHUB_REPOSITORY" --comments` bzw.
+          `gh api "repos/$GITHUB_REPOSITORY/pulls/$N/comments"`).
           Existiert KEIN früherer Review von dir, ist das **Runde 1**. Sonst **Folge-Runde**.
 
           ## Runde 1 — erschöpfender erster Pass
@@ -167,6 +172,11 @@ jobs:
           # ohne bwrap-Sandbox direkt im Runner-Prozess — akzeptabel, da der ARC-Pod selbst
           # bereits eine isolierte Sandbox ist (ephemeral, kein Zugriff auf Host).
           CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '0'
+          # gh-Auth für den Reviewer: das state-aware Folge-Runden-Protokoll (Issue #13) ruft
+          # `gh pr view`/`gh api` auf, um eigene frühere Review-Comments zu lesen. Mit
+          # SUBPROCESS_ENV_SCRUB=0 erbt der Bash-Tool-Subprozess diese Env, sodass gh
+          # authentifiziert ist (sonst scheitert der Call still → Folge-Runde degradiert zu Runde 1).
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}

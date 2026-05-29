@@ -16,9 +16,22 @@ on:
         type: string
         default: ''
       review-prompt:
-        description: 'Review prompt passed directly to claude-code-action'
+        description: |
+          Repo-spezifischer Review-Prompt (WAS reviewen: Stack, Fokuspunkte,
+          Posting-Konvention). Wird der org-weiten Review-Protokoll-Preamble
+          (siehe `review-protocol`) nachgestellt — der Caller muss Severity-Skala
+          und State-Awareness NICHT selbst mitliefern, das erbt er zentral.
         type: string
         required: true
+      review-protocol:
+        description: |
+          Org-weite Review-Protokoll-Preamble (Severity-Skala, erschöpfender erster
+          Pass, state-aware Folge-Runden). Default ist die Standard-Preamble dieses
+          Workflows — Single Source of Truth für alle Org-Repos. Nur überschreiben,
+          wenn ein Repo bewusst ein abweichendes Protokoll braucht (Ausnahme).
+        type: string
+        required: false
+        default: ''
       show-full-output:
         description: 'Show full Claude output for debugging (WARNING: may expose secrets in logs)'
         type: boolean
@@ -76,6 +89,73 @@ jobs:
             find .claude -type l -delete 2>/dev/null || true
           fi
 
+      - name: Compose review prompt (protocol preamble + repo prompt)
+        # Stellt dem repo-spezifischen Prompt die org-weite Review-Protokoll-Preamble
+        # voran (Severity-Gating + erschöpfender erster Pass + state-aware Folge-Runden,
+        # Issue #13). Single Source of Truth: ein Edit hier wirkt auf alle Org-Repos.
+        # Schreibt das Resultat als Multiline-Env-Var FULL_PROMPT (heredoc-Delimiter,
+        # damit beliebige Prompt-Inhalte ohne YAML-/Shell-Interpolation durchlaufen).
+        env:
+          REVIEW_PROTOCOL_INPUT: ${{ inputs.review-protocol }}
+          REVIEW_PROMPT_INPUT: ${{ inputs.review-prompt }}
+        run: |
+          set -euo pipefail
+
+          # Default-Protokoll als Datei schreiben. Bewusst KEIN $(cat <<EOF) — ein
+          # single-quoted Heredoc INNERHALB einer Command-Substitution bricht bashs
+          # Lexer an einem unbalancierten ASCII-" im Body (z. B. im Text „nice to have").
+          # Direkt-in-Datei-Heredoc ist robust gegen beliebigen Body-Inhalt.
+          cat > /tmp/default-protocol.md <<'PROTOCOL'
+          # Review-Protokoll (org-weit, verbindlich)
+
+          ## Severity-Skala — jedes Finding MUSS exakt eines dieser Labels als Präfix tragen
+          - **[BLOCKER]** — Bug, Sicherheitslücke, Datenverlust: geht so nicht live. Blockt den Merge.
+          - **[WARNING]** — messbare Regression oder konkretes Risiko: sollte gefixt werden. Blockt den Merge.
+          - **[NIT]** — kosmetisch, Stil, "nice to have": blockt NICHT. Wird NICHT nachverfolgt
+            (kein Follow-up-Issue). Trivial mitnehmen oder fallenlassen.
+
+          ## Bestimme zuerst die Review-Runde
+          Lies deine eigenen, bereits auf diesem PR vorhandenen Review-Comments ein
+          (`gh pr view <PR> --comments` bzw. `gh api repos/<repo>/pulls/<PR>/comments`).
+          Existiert KEIN früherer Review von dir, ist das **Runde 1**. Sonst **Folge-Runde**.
+
+          ## Runde 1 — erschöpfender erster Pass
+          - Reviewe den GESAMTEN PR-Diff vollständig in EINEM Durchgang.
+          - Melde ALLE Findings aller Severitys SOFORT. Spare NICHTS für "später" auf —
+            späte Runden dürfen keine Themen aufwerfen, die hier schon sichtbar waren.
+          - Jedes Finding mit Severity-Label präfixen.
+
+          ## Folge-Runden — state-aware Delta-Review
+          - Prüfe NUR die Änderungen seit deinem letzten Review (neue Commits / neuer Diff),
+            NICHT den ganzen PR erneut.
+          - Verifiziere für jedes frühere Finding, ob es adressiert wurde, und sage das explizit
+            ("[RESOLVED] ..." / "[STILL OPEN] ...").
+          - Melde NEUE Findings NUR, wenn sie **[BLOCKER]**-Severity haben (echte Regression,
+            die der Fix eingeführt hat). KEINE neuen [WARNING]/[NIT] in Folge-Runden — die
+            hätten in Runde 1 auffallen müssen.
+
+          ## Konvergenz
+          Bleiben keine offenen [BLOCKER]/[WARNING] mehr, sage das klar
+          ("Keine blockierenden Findings — merge-ready"), damit die Fix-Loop terminiert.
+          PROTOCOL
+
+          # Caller-Override hat Vorrang, sonst Default aus der Datei.
+          if [ -n "$REVIEW_PROTOCOL_INPUT" ]; then
+            printf '%s\n' "$REVIEW_PROTOCOL_INPUT" > /tmp/protocol.md
+          else
+            cp /tmp/default-protocol.md /tmp/protocol.md
+          fi
+
+          {
+            echo "FULL_PROMPT<<__CLAUDE_PROMPT_EOF__"
+            cat /tmp/protocol.md
+            echo ""
+            echo "---"
+            echo ""
+            printf '%s\n' "$REVIEW_PROMPT_INPUT"
+            echo "__CLAUDE_PROMPT_EOF__"
+          } >> "$GITHUB_ENV"
+
       - name: Run Claude Code Review
         uses: anthropics/claude-code-action@v1
         env:
@@ -90,7 +170,7 @@ jobs:
         with:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
-          prompt: ${{ inputs.review-prompt }}
+          prompt: ${{ env.FULL_PROMPT }}
           claude_args: ${{ inputs.claude-args }}
           show_full_output: ${{ inputs.show-full-output }}
           # Bypass flaky GitHub API permission-check (504 timeout from self-hosted K8s runner).

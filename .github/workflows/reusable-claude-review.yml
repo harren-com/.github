@@ -161,6 +161,54 @@ jobs:
             echo "__CLAUDE_PROMPT_EOF__"
           } >> "$GITHUB_ENV"
 
+      - name: Reconcile stale bot inline comments
+        # Inline-Comment-Reconciliation (Issue #15):
+        # Das state-aware Review-Protokoll dedupliziert nur den Prosa-Sticky-Summary
+        # über die Runden (siehe "Compose review prompt"-Step oben), NICHT die
+        # zeilengenauen Inline-Review-Comments. Jeder Run postet frische
+        # Inline-Comments; die alten werden nie aufgelöst/gelöscht — GitHub klappt
+        # einen Inline-Comment nur dann als "outdated" ein, wenn sich exakt seine
+        # Zeile ändert. Findings, die an anderer Stelle behoben wurden, bleiben
+        # sichtbar. Resultat: die Inline-Ebene ("fix this") divergiert von der
+        # Sticky-Summary ("merge-ready"), der Review wirkt zerfasert/kaputt.
+        #
+        # Fix: VOR dem Action-Lauf die bestehenden github-actions[bot]-INLINE-
+        # Comments des PR löschen, damit die Inline-Ebene jede Runde frisch
+        # aufgebaut wird und konsistent zur Sticky-Summary bleibt. Nur Bot-Inline-
+        # Comments werden entfernt; User-Comments und der persistente
+        # Sticky-Issue-Comment (Single-Source-of-Truth des kumulativen State,
+        # den die Folge-Runden ohnehin als Quelle nutzen) bleiben unangetastet.
+        # gh ist bereits aus dem "Install dependencies"-Step auf dem PATH.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          # PR-Nr aus $GITHUB_REF (refs/pull/<N>/merge), Repo aus $GITHUB_REPOSITORY.
+          PR="${GITHUB_REF#refs/pull/}"
+          PR="${PR%/merge}"
+          if ! [[ "$PR" =~ ^[0-9]+$ ]]; then
+            echo "Keine PR-Nr aus GITHUB_REF=$GITHUB_REF ableitbar — überspringe."
+            exit 0
+          fi
+          echo "Reconcile: lösche stale github-actions[bot]-Inline-Comments auf PR #$PR ..."
+          # PR-Review-Comments paginiert holen und Bot-IDs sammeln. Fehlertolerant:
+          # bei API-Hiccup leeres Ergebnis statt Job-Fail.
+          ids="$(gh api --paginate \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR}/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]") | .id' \
+            2>/dev/null || true)"
+          if [ -z "$ids" ]; then
+            echo "Keine Bot-Inline-Comments zu entfernen."
+            exit 0
+          fi
+          for id in $ids; do
+            echo "Lösche Inline-Comment $id"
+            gh api -X DELETE \
+              "repos/${GITHUB_REPOSITORY}/pulls/comments/${id}" \
+              >/dev/null 2>&1 || true
+          done
+          echo "Inline-Comment-Reconciliation abgeschlossen."
+
       - name: Run Claude Code Review
         uses: anthropics/claude-code-action@v1
         env:

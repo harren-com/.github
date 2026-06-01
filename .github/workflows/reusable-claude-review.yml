@@ -182,6 +182,15 @@ jobs:
             Fehlt der Marker oder ist er fehlformatiert, wertet der Gate konservativ als
             BLOCKED (roter Check). Gib ihn daher IMMER und korrekt aus.
 
+          ### Persistenz des Runden-Verdikts (Issue #21)
+          Das Runden-Verdikt wird vom WORKFLOW persistiert: Ein deterministischer Step
+          schreibt nach jeder Runde einen editierten Sticky-Issue-Comment (stabiler
+          Marker `<!-- claude-review-verdict-sticky -->`) mit Verdikt, Runde und Counts.
+          Du musst dafür NUR den `REVIEW_VERDICT`-Marker oben korrekt ausgeben — den
+          persistenten Audit-Comment baut und aktualisiert der Workflow selbst. Deine
+          Inline-Comments bleiben rein zeilengenaue "fix-this-here"-Hinweise; sie werden
+          pro Runde reconciled (gelöscht/neu) und sind NICHT die Audit-Quelle.
+
           ## Finale Pflicht-Aktion nach dem Summary — APPROVE oder CHANGES_REQUESTED
           Nach dem Summary MUSS der Reviewer genau EINEN gh-Review-Submit ausführen, damit
           GitHubs `reviewDecision` korrekt gesetzt ist:
@@ -237,6 +246,13 @@ jobs:
         # Sticky-Issue-Comment (Single-Source-of-Truth des kumulativen State,
         # den die Folge-Runden ohnehin als Quelle nutzen) bleiben unangetastet.
         # gh ist bereits aus dem "Install dependencies"-Step auf dem PATH.
+        #
+        # Belt-and-Suspenders (Issue #21): Dieser Reconcile betrifft ausschließlich
+        # INLINE-Comments (`pulls/$N/comments`) — der persistente Verdikt-Sticky ist
+        # ein ISSUE-Comment (`issues/$N/comments`) und damit ohnehin nicht betroffen.
+        # Dennoch filtern wir den Sticky-Marker `<!-- claude-review-verdict-sticky -->`
+        # explizit aus der Löschmenge heraus, damit ein bewusst persistenter
+        # Verdikt-Kommentar NIE versehentlich erfasst wird (Audit-Trail-Schutz).
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -251,9 +267,11 @@ jobs:
           echo "Reconcile: lösche stale github-actions[bot]-Inline-Comments auf PR #$PR ..."
           # PR-Review-Comments paginiert holen und Bot-IDs sammeln. Fehlertolerant:
           # bei API-Hiccup leeres Ergebnis statt Job-Fail.
+          # Marker-basierter Schutz (Issue #21): Comments, die den Verdikt-Sticky-Marker
+          # tragen, werden NIE gelöscht — der Audit-Trail bleibt erhalten.
           ids="$(gh api --paginate \
             "repos/${GITHUB_REPOSITORY}/pulls/${PR}/comments" \
-            --jq '.[] | select(.user.login == "github-actions[bot]") | .id' \
+            --jq '.[] | select(.user.login == "github-actions[bot]") | select(.body | contains("claude-review-verdict-sticky") | not) | .id' \
             2>/dev/null || true)"
           if [ -z "$ids" ]; then
             echo "Keine Bot-Inline-Comments zu entfernen."
@@ -292,6 +310,94 @@ jobs:
           # Bypass flaky GitHub API permission-check (504 timeout from self-hosted K8s runner).
           # Owner-repos only — safe as long as this workflow is org-internal.
           allowed_non_write_users: ${{ inputs.allowed-non-write-users }}
+
+      - name: Persist round verdict (sticky issue comment, audit trail)
+        # Persistenter Verdikt-Sticky (Issue #21):
+        # Das Runden-Verdikt darf NICHT als löschbarer Inline-Comment/Review-Body
+        # leben — der Reconcile-Step räumt Inline-Bot-Comments jede Runde weg, womit
+        # das Verdikt einer ≥3.-Runde verschwand (kein Audit-Trail mehr).
+        # Dieser Step upsertet stattdessen einen persistenten ISSUE-Comment (NICHT
+        # Inline) mit stabilem Marker `<!-- claude-review-verdict-sticky -->`:
+        # existiert er bereits -> PATCH (Body in-place updaten), sonst neu anlegen.
+        # Quelle ist derselbe REVIEW_VERDICT-Marker, den die Action vom Modell erzwingt.
+        # Dieser Comment ist die persistente Audit-Quelle und überlebt jeden Reconcile
+        # (der Reconcile filtert den Marker explizit aus, s. o.).
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          PR="${GITHUB_REF#refs/pull/}"
+          PR="${PR%/merge}"
+          REPO="${GITHUB_REPOSITORY}"
+          if ! [[ "$PR" =~ ^[0-9]+$ ]]; then
+            echo "Keine PR-Nr aus GITHUB_REF=$GITHUB_REF ableitbar — überspringe Sticky."
+            exit 0
+          fi
+
+          # Jüngsten REVIEW_VERDICT-Marker aus Bot-Review-Bodies + Issue-Comments ziehen
+          # (identische Quelle wie der Gate-Step). Den Sticky selbst ausschließen, damit
+          # wir nicht unseren eigenen, evtl. veralteten Marker erneut konservieren.
+          : > /tmp/sticky-bodies.txt
+          gh api --paginate "repos/${REPO}/pulls/${PR}/reviews" \
+            --jq '.[] | select(.user.login == "github-actions[bot]") | "\(.submitted_at // .created_at // "")\t\(.body // "" | gsub("\r";"") | gsub("\n";"\\n"))"' \
+            >> /tmp/sticky-bodies.txt 2>/dev/null || true
+          gh api --paginate "repos/${REPO}/issues/${PR}/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]") | select(.body | contains("claude-review-verdict-sticky") | not) | "\(.created_at // "")\t\(.body // "" | gsub("\r";"") | gsub("\n";"\\n"))"' \
+            >> /tmp/sticky-bodies.txt 2>/dev/null || true
+
+          MARKER_LINE="$(sort /tmp/sticky-bodies.txt \
+            | grep -o '<!-- REVIEW_VERDICT:[^>]*-->' \
+            | tail -1 || true)"
+
+          if [ -z "$MARKER_LINE" ]; then
+            STATUS="UNBEKANNT"; BLOCKERS="?"; WARNINGS="?"; ROUND="?"
+            echo "Kein REVIEW_VERDICT-Marker gefunden — Sticky mit UNBEKANNT schreiben."
+          else
+            STATUS="$(echo "$MARKER_LINE"   | sed -n 's/.*status=\([A-Za-z]*\).*/\1/p')"
+            BLOCKERS="$(echo "$MARKER_LINE" | sed -n 's/.*blockers=\([0-9]*\).*/\1/p')"
+            WARNINGS="$(echo "$MARKER_LINE" | sed -n 's/.*warnings=\([0-9]*\).*/\1/p')"
+            ROUND="$(echo "$MARKER_LINE"    | sed -n 's/.*round=\([0-9]*\).*/\1/p')"
+            STATUS="${STATUS:-UNBEKANNT}"; BLOCKERS="${BLOCKERS:-?}"
+            WARNINGS="${WARNINGS:-?}"; ROUND="${ROUND:-?}"
+          fi
+
+          NOW="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          # Sticky-Body direkt in Datei schreiben (kein $(cat <<EOF) — bricht bashs
+          # Lexer an unbalanciertem ASCII-"). Marker als allererste Zeile.
+          cat > /tmp/sticky-body.md <<STICKY
+          <!-- claude-review-verdict-sticky -->
+          ## Claude-Review — Verdikt (persistenter Audit-Trail)
+
+          | Feld | Wert |
+          |---|---|
+          | Verdikt | \`${STATUS}\` |
+          | Offene BLOCKER | ${BLOCKERS} |
+          | Offene WARNINGS | ${WARNINGS} |
+          | Runde | ${ROUND} |
+          | Aktualisiert (UTC) | ${NOW} |
+
+          _Dieser Kommentar wird vom Review-Workflow nach jeder Runde edit-in-place aktualisiert (Issue #21). Inline-Comments bleiben zeilengenaue Hinweise und werden pro Runde reconciled._
+          STICKY
+
+          # Existierenden Sticky finden (Marker im Body), sonst neu anlegen.
+          EXISTING_ID="$(gh api --paginate "repos/${REPO}/issues/${PR}/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]") | select(.body | contains("claude-review-verdict-sticky")) | .id' \
+            2>/dev/null | head -1 || true)"
+
+          if [ -n "$EXISTING_ID" ]; then
+            echo "Aktualisiere Verdikt-Sticky (Comment $EXISTING_ID) ..."
+            gh api -X PATCH "repos/${REPO}/issues/comments/${EXISTING_ID}" \
+              -F body=@/tmp/sticky-body.md >/dev/null 2>&1 \
+              && echo "Sticky aktualisiert." \
+              || echo "WARN: Sticky-PATCH fehlgeschlagen (non-fatal)."
+          else
+            echo "Lege neuen Verdikt-Sticky an ..."
+            gh api -X POST "repos/${REPO}/issues/${PR}/comments" \
+              -F body=@/tmp/sticky-body.md >/dev/null 2>&1 \
+              && echo "Sticky angelegt." \
+              || echo "WARN: Sticky-POST fehlgeschlagen (non-fatal)."
+          fi
 
       - name: Deterministic merge gate (parse REVIEW_VERDICT marker)
         # Deterministischer Merge-Gate (Issue #20):

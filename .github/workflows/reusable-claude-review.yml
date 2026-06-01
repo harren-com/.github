@@ -51,11 +51,11 @@ on:
           Default 25 ist eine Worst-Case-Bremse gegen endlose Loops — normale Reviews
           beenden sich deutlich früher (Runde 1 typisch 8–15 Turns).
           Zum Überschreiben: `max-turns: 40` im Caller-Workflow unter `with:`.
-          Doppel-Flag-Semantik: dieser Wert wird an claude_args ANGEHÄNGT.
-          Falls ein Caller bereits --max-turns in seinen claude-args setzt, gewinnt
-          claude-code-action beim letzten Flag (last-wins) — d.h. der Caller-Wert
-          überschreibt den Default. Bewusstes Überschreiben also via diesem Input
-          ODER via claude-args möglich; letzterem hat Vorrang.
+          Doppel-Flag-Semantik: dieser Wert wird an claude_args ANGEHÄNGT und steht
+          damit HINTEN — claude-code-action nimmt beim letzten Flag (last-wins) diesen
+          Input-Wert. Folge: ein `--max-turns` in den Caller-`claude-args` ist
+          WIRKUNGSLOS (wird vom angehängten Input-Wert überschrieben). Der einzige
+          wirksame Weg, den Cap zu setzen/erhöhen, ist dieser Input `max-turns`.
         type: number
         default: 25
 

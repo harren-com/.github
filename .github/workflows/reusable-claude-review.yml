@@ -45,6 +45,19 @@ on:
           Default: 'HendrikHarren' (org owner, write access implied).
         type: string
         default: 'HendrikHarren'
+      max-turns:
+        description: |
+          Maximale Anzahl agentischer Turns im Claude-Review-Loop (--max-turns-Flag).
+          Default 25 ist eine Worst-Case-Bremse gegen endlose Loops — normale Reviews
+          beenden sich deutlich früher (Runde 1 typisch 8–15 Turns).
+          Zum Überschreiben: `max-turns: 40` im Caller-Workflow unter `with:`.
+          Doppel-Flag-Semantik: dieser Wert wird an claude_args ANGEHÄNGT und steht
+          damit HINTEN — claude-code-action nimmt beim letzten Flag (last-wins) diesen
+          Input-Wert. Folge: ein `--max-turns` in den Caller-`claude-args` ist
+          WIRKUNGSLOS (wird vom angehängten Input-Wert überschrieben). Der einzige
+          wirksame Weg, den Cap zu setzen/erhöhen, ist dieser Input `max-turns`.
+        type: number
+        default: 25
 
 jobs:
   claude-review:
@@ -305,7 +318,11 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           prompt: ${{ env.FULL_PROMPT }}
-          claude_args: ${{ inputs.claude-args }}
+          # --max-turns wird ANGEHÄNGT → last-wins-Semantik (claude-code-action).
+          # Der Default-Wert (25) steht hinten und gewinnt daher gegen einen Caller,
+          # der --max-turns in claude-args setzt. Bewusstes Erhöhen: Input `max-turns`
+          # überschreiben (z.B. max-turns: 40) — dieser Input ersetzt dann den Default.
+          claude_args: ${{ inputs.claude-args }} --max-turns ${{ inputs.max-turns }}
           show_full_output: ${{ inputs.show-full-output }}
           # Bypass flaky GitHub API permission-check (504 timeout from self-hosted K8s runner).
           # Owner-repos only — safe as long as this workflow is org-internal.

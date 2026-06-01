@@ -167,6 +167,21 @@ jobs:
           "Keine blockierenden Findings — merge-ready." oder eine klare Liste offener Blocker.
           Ein leerer Body ist unzulässig.
 
+          ## PFLICHT: Maschinenlesbarer Verdikt-Marker am Ende des Summary (Issue #20)
+          Am ALLERLETZTEN Ende deines Summary-Bodies MUSST du GENAU EINE Marker-Zeile
+          ausgeben, exakt in diesem Format (HTML-Kommentar, im gerenderten Markdown
+          unsichtbar):
+              <!-- REVIEW_VERDICT: status=BLOCKED|CLEAN blockers=<n> warnings=<n> round=<n> -->
+          Regeln:
+          - `status=BLOCKED`, wenn IRGENDEIN offenes [BLOCKER] ODER [WARNING] verbleibt,
+            sonst `status=CLEAN`.
+          - `blockers=<n>` = Anzahl offener [BLOCKER], `warnings=<n>` = Anzahl offener
+            [WARNING], `round=<n>` = aktuelle Review-Runde.
+          - Genau EINE solche Zeile, exakt dieses Format — ein deterministischer
+            Workflow-Step parst sie und setzt damit den Merge-Gate (roter/grüner Check).
+            Fehlt der Marker oder ist er fehlformatiert, wertet der Gate konservativ als
+            BLOCKED (roter Check). Gib ihn daher IMMER und korrekt aus.
+
           ## Finale Pflicht-Aktion nach dem Summary — APPROVE oder CHANGES_REQUESTED
           Nach dem Summary MUSS der Reviewer genau EINEN gh-Review-Submit ausführen, damit
           GitHubs `reviewDecision` korrekt gesetzt ist:
@@ -177,8 +192,9 @@ jobs:
           `$N` und `$GITHUB_REPOSITORY` sind aus dem Schritt "Bestimme die Review-Runde" bereits
           bekannt. `GH_TOKEN` und `gh` sind in der Action-Step-Umgebung verfügbar.
           github-actions[bot] darf approven — er ist nicht PR-Author, die Permission ist gegeben.
-          Diesen Submit NICHT weglassen: ohne ihn bleibt `reviewDecision` auf CHANGES_REQUESTED
-          hängen, auch wenn inhaltlich alles grün ist.
+          Dieser Submit ist kosmetisch für GitHubs `reviewDecision`; der VERLÄSSLICHE
+          Merge-Gate ist der deterministische Workflow-Step, der den Verdikt-Marker parst.
+          Lass den Submit dennoch nicht weg.
 
           ## Konvergenz
           Bleiben keine offenen [BLOCKER]/[WARNING] mehr, sage das klar im Summary
@@ -276,3 +292,104 @@ jobs:
           # Bypass flaky GitHub API permission-check (504 timeout from self-hosted K8s runner).
           # Owner-repos only — safe as long as this workflow is org-internal.
           allowed_non_write_users: ${{ inputs.allowed-non-write-users }}
+
+      - name: Deterministic merge gate (parse REVIEW_VERDICT marker)
+        # Deterministischer Merge-Gate (Issue #20):
+        # Der Gate wird NICHT dem Modell überlassen — das war nicht-deterministisch
+        # (führte das Modell `gh pr review` nicht aus oder failte der Call still,
+        # blieb der Check grün und der Merge lief über offene WARNINGs durch).
+        # Stattdessen parst DIESER Step den maschinenlesbaren Verdikt-Marker, den die
+        # Protokoll-Preamble vom Modell erzwingt:
+        #   <!-- REVIEW_VERDICT: status=BLOCKED|CLEAN blockers=<n> warnings=<n> round=<n> -->
+        # Quelle ist der jüngste github-actions[bot]-Review-Body bzw. Issue-Comment.
+        #
+        # Da dieser Step im SELBEN Job NACH der Action läuft, macht ein `exit 1` die
+        # Job-Conclusion (= der `claude-review`-Check) rot. Das ist der verlässliche,
+        # deterministische Pre-Merge-Indikator. Fail-safe: kein/ungültiger Marker =>
+        # konservativ BLOCKED (roter Check), zwingt Aufmerksamkeit.
+        #
+        # DESCOPE (Free-Tier): Hard-Enforcement (Merge über offene WARNINGs ohne Admin
+        # unmöglich) braucht Branch-Protection/Required-Checks — auf privaten Repos nur
+        # mit Team-Plan, den die Org bewusst NICHT hat. Dieser rote Check liefert die
+        # Pre-Merge-Sichtbarkeit; die Hard-Enforcement-Lücke ist POST-HOC durch
+        # review-gate-alert.yml (cloud-dev-environment #283) abgedeckt (Alert-Issue bei
+        # Merge ohne grünen Review).
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -uo pipefail
+          # PR-Nr aus $GITHUB_REF (refs/pull/<N>/merge), Repo aus $GITHUB_REPOSITORY.
+          PR="${GITHUB_REF#refs/pull/}"
+          PR="${PR%/merge}"
+          REPO="${GITHUB_REPOSITORY}"
+          if ! [[ "$PR" =~ ^[0-9]+$ ]]; then
+            echo "Keine PR-Nr aus GITHUB_REF=$GITHUB_REF ableitbar — Gate kann nicht greifen."
+            echo "::error::Merge-Gate: keine PR-Nummer ableitbar."
+            {
+              echo "## Claude-Review Merge-Gate"
+              echo ""
+              echo "**Ergebnis:** FEHLER — keine PR-Nummer aus \`$GITHUB_REF\` ableitbar."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          fi
+
+          # Alle Kandidaten-Bodies (Review-Bodies + Issue-Comments) des Bots sammeln und
+          # die jüngste gültige REVIEW_VERDICT-Marker-Zeile herausziehen. Beide Quellen
+          # paginiert, damit auch ältere Runden erfasst sind; sortiert nach created_at.
+          : > /tmp/gate-bodies.txt
+          gh api --paginate "repos/${REPO}/pulls/${PR}/reviews" \
+            --jq '.[] | select(.user.login == "github-actions[bot]") | "\(.submitted_at // .created_at // "")\t\(.body // "" | gsub("\r";"") | gsub("\n";"\\n"))"' \
+            >> /tmp/gate-bodies.txt 2>/dev/null || true
+          gh api --paginate "repos/${REPO}/issues/${PR}/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]") | "\(.created_at // "")\t\(.body // "" | gsub("\r";"") | gsub("\n";"\\n"))"' \
+            >> /tmp/gate-bodies.txt 2>/dev/null || true
+
+          # Nach Zeitstempel sortieren (jüngste zuletzt), Zeilen mit Marker filtern,
+          # letzte (= jüngste) nehmen. Der Body ist pro Zeile mit \n maskiert, der
+          # Marker steht damit auf derselben Zeile wie sein Body.
+          MARKER_LINE="$(sort /tmp/gate-bodies.txt \
+            | grep -o '<!-- REVIEW_VERDICT:[^>]*-->' \
+            | tail -1 || true)"
+
+          if [ -z "$MARKER_LINE" ]; then
+            echo "Kein gültiger REVIEW_VERDICT-Marker gefunden — konservativ BLOCKED."
+            {
+              echo "## Claude-Review Merge-Gate"
+              echo ""
+              echo "**Verdikt:** BLOCKED (fail-safe)"
+              echo ""
+              echo "Kein \`REVIEW_VERDICT\`-Marker im jüngsten Bot-Review/-Comment gefunden."
+              echo "Der Gate wertet das konservativ als blockierend (roter Check)."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Merge-Gate BLOCKED — kein gültiger REVIEW_VERDICT-Marker gefunden."
+            exit 1
+          fi
+
+          echo "Gefundener Marker: $MARKER_LINE"
+          STATUS="$(echo "$MARKER_LINE"   | sed -n 's/.*status=\([A-Za-z]*\).*/\1/p')"
+          BLOCKERS="$(echo "$MARKER_LINE" | sed -n 's/.*blockers=\([0-9]*\).*/\1/p')"
+          WARNINGS="$(echo "$MARKER_LINE" | sed -n 's/.*warnings=\([0-9]*\).*/\1/p')"
+          ROUND="$(echo "$MARKER_LINE"    | sed -n 's/.*round=\([0-9]*\).*/\1/p')"
+          BLOCKERS="${BLOCKERS:-?}"
+          WARNINGS="${WARNINGS:-?}"
+          ROUND="${ROUND:-?}"
+
+          {
+            echo "## Claude-Review Merge-Gate"
+            echo ""
+            echo "| Feld | Wert |"
+            echo "|---|---|"
+            echo "| Verdikt | \`${STATUS:-UNBEKANNT}\` |"
+            echo "| Offene BLOCKER | ${BLOCKERS} |"
+            echo "| Offene WARNINGS | ${WARNINGS} |"
+            echo "| Runde | ${ROUND} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$STATUS" = "CLEAN" ]; then
+            echo "Merge-Gate: CLEAN — keine offenen BLOCKER/WARNING. Check grün."
+            exit 0
+          fi
+          # Alles außer eindeutig CLEAN (inkl. BLOCKED, leer, unerwartet) => rot.
+          echo "::error::Merge-Gate BLOCKED — Verdikt=${STATUS:-UNBEKANNT}, blockers=${BLOCKERS}, warnings=${WARNINGS}."
+          exit 1

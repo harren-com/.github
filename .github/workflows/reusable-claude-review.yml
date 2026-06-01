@@ -135,13 +135,36 @@ jobs:
             NICHT den ganzen PR erneut.
           - Verifiziere für jedes frühere Finding, ob es adressiert wurde, und sage das explizit
             ("[RESOLVED] ..." / "[STILL OPEN] ...").
-          - Melde NEUE Findings NUR, wenn sie **[BLOCKER]**-Severity haben (echte Regression,
-            die der Fix eingeführt hat). KEINE neuen [WARNING]/[NIT] in Folge-Runden — die
-            hätten in Runde 1 auffallen müssen.
+          - Melde NEUE Findings NUR, wenn der Fix sie **eingeführt** hat (echte Regression im
+            geänderten Code). Pre-existing Punkte, die in Runde 1 übersehen wurden, werden NICHT
+            nachgereicht. Erlaubte Severity für fix-eingeführte Regressionen: [BLOCKER] oder
+            [WARNING]. KEINE neuen [NIT] in Folge-Runden.
+
+          ## Pflicht-Summary jede Runde
+          Am Ende JEDER Runde MUSS ein nicht-leerer Summary als PR-Review-Body abgegeben werden.
+          Format: "## Code-Review — Runde N" als Überschrift, gefolgt von einer Auflistung aller
+          Findings mit ihrem Status. In Folge-Runden: "[RESOLVED] ..." bzw. "[STILL OPEN] ..."
+          für jedes frühere Finding, danach neue Findings falls vorhanden. Letzter Satz entweder
+          "Keine blockierenden Findings — merge-ready." oder eine klare Liste offener Blocker.
+          Ein leerer Body ist unzulässig.
+
+          ## Finale Pflicht-Aktion nach dem Summary — APPROVE oder CHANGES_REQUESTED
+          Nach dem Summary MUSS der Reviewer genau EINEN gh-Review-Submit ausführen, damit
+          GitHubs `reviewDecision` korrekt gesetzt ist:
+          - Offene [BLOCKER] oder [WARNING] vorhanden →
+              gh pr review "$N" --repo "$GITHUB_REPOSITORY" --request-changes --body "<dein Summary>"
+          - Keine offenen [BLOCKER]/[WARNING] →
+              gh pr review "$N" --repo "$GITHUB_REPOSITORY" --approve --body "<dein Summary>"
+          `$N` und `$GITHUB_REPOSITORY` sind aus dem Schritt "Bestimme die Review-Runde" bereits
+          bekannt. `GH_TOKEN` und `gh` sind in der Action-Step-Umgebung verfügbar.
+          github-actions[bot] darf approven — er ist nicht PR-Author, die Permission ist gegeben.
+          Diesen Submit NICHT weglassen: ohne ihn bleibt `reviewDecision` auf CHANGES_REQUESTED
+          hängen, auch wenn inhaltlich alles grün ist.
 
           ## Konvergenz
-          Bleiben keine offenen [BLOCKER]/[WARNING] mehr, sage das klar
-          ("Keine blockierenden Findings — merge-ready"), damit die Fix-Loop terminiert.
+          Bleiben keine offenen [BLOCKER]/[WARNING] mehr, sage das klar im Summary
+          ("Keine blockierenden Findings — merge-ready") und reiche ein APPROVE ein,
+          damit die Fix-Loop terminiert und der Merge-Gate freigibt.
           PROTOCOL
 
           # Caller-Override hat Vorrang, sonst Default aus der Datei.

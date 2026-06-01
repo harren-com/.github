@@ -130,6 +130,25 @@ jobs:
             späte Runden dürfen keine Themen aufwerfen, die hier schon sichtbar waren.
           - Jedes Finding mit Severity-Label präfixen.
 
+          ### PFLICHT: Completeness-Self-Check VOR dem Summary (Issue #19)
+          Nach dem ersten Durchgang, aber BEVOR du das Summary abgibst, ist ein zweiter,
+          erzwungener Audit-Pass obligatorisch. Bei großen Diffs verteilt sich die
+          Aufmerksamkeit zu dünn, um "alles in einem Durchgang" zuverlässig zu finden —
+          dieser zweite Pass schließt die Lücke und erzwingt Konvergenz in Runde 1.
+
+          - **Selbst-Audit:** Gehe jede im Diff NEU hinzugefügte oder geänderte Funktion
+            EINZELN durch und prüfe explizit auf:
+            (a) Korrektheit der Logik,
+            (b) Zähl-/Off-by-One-/Aggregations-Fehler,
+            (c) unbehandelte Fehlerpfade / Edge-Cases.
+            Liste pro Funktion kurz, was geprüft wurde.
+          - Erst wenn dieser Audit-Pass abgeschlossen ist, gib das Summary ab.
+          - **Größenabhängige Gründlichkeit:** Bei großen Diffs (Richtwert: > ~300
+            geänderte Zeilen oder eine neue Datei > 200 Zeilen) hat dieser Audit-Pass
+            besonders gründlich datei- und funktionsweise zu erfolgen — "alles in einem
+            Durchgang finden" stößt bei diesem Umfang an Aufmerksamkeitsgrenzen, deshalb
+            jede Datei und jede Funktion bewusst und getrennt durchgehen.
+
           ## Folge-Runden — state-aware Delta-Review
           - Prüfe NUR die Änderungen seit deinem letzten Review (neue Commits / neuer Diff),
             NICHT den ganzen PR erneut.

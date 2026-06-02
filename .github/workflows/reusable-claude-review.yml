@@ -48,16 +48,18 @@ on:
       max-turns:
         description: |
           Maximale Anzahl agentischer Turns im Claude-Review-Loop (--max-turns-Flag).
-          Default 25 ist eine Worst-Case-Bremse gegen endlose Loops — normale Reviews
-          beenden sich deutlich früher (Runde 1 typisch 8–15 Turns).
-          Zum Überschreiben: `max-turns: 40` im Caller-Workflow unter `with:`.
+          Default 40 ist eine Worst-Case-Bremse gegen endlose Loops — normale Reviews
+          beenden sich deutlich früher (Runde 1 typisch 8–15 Turns). 40 statt 25
+          (Issue #68): größere Diffs streiften den 25er-Cap, was den REVIEW_VERDICT-
+          Marker abschnitt → Gate fiel auf BLOCKED.
+          Zum Überschreiben: `max-turns: 60` im Caller-Workflow unter `with:`.
           Doppel-Flag-Semantik: dieser Wert wird an claude_args ANGEHÄNGT und steht
           damit HINTEN — claude-code-action nimmt beim letzten Flag (last-wins) diesen
           Input-Wert. Folge: ein `--max-turns` in den Caller-`claude-args` ist
           WIRKUNGSLOS (wird vom angehängten Input-Wert überschrieben). Der einzige
           wirksame Weg, den Cap zu setzen/erhöhen, ist dieser Input `max-turns`.
         type: number
-        default: 25
+        default: 40
 
 jobs:
   claude-review:
@@ -299,6 +301,12 @@ jobs:
           echo "Inline-Comment-Reconciliation abgeschlossen."
 
       - name: Run Claude Code Review
+        id: run_review
+        # continue-on-error (Issue #68): Ein Fehlschlag der Action (Turn-Cap, Tool-/
+        # Sandbox-Fehler) soll NICHT den Job hart rot machen, bevor der Merge-Gate
+        # greift. Der Gate-Step unten (if: always()) bleibt der alleinige Entscheider
+        # über den claude-review-Check — entkoppelt vom Action-Step-Outcome.
+        continue-on-error: true
         uses: anthropics/claude-code-action@v1
         env:
           # claude-code-action v2.1+ installiert bubblewrap (bwrap) für Subprocess-Isolation
@@ -319,9 +327,9 @@ jobs:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           prompt: ${{ env.FULL_PROMPT }}
           # --max-turns wird ANGEHÄNGT → last-wins-Semantik (claude-code-action).
-          # Der Default-Wert (25) steht hinten und gewinnt daher gegen einen Caller,
+          # Der Default-Wert (40) steht hinten und gewinnt daher gegen einen Caller,
           # der --max-turns in claude-args setzt. Bewusstes Erhöhen: Input `max-turns`
-          # überschreiben (z.B. max-turns: 40) — dieser Input ersetzt dann den Default.
+          # überschreiben (z.B. max-turns: 60) — dieser Input ersetzt dann den Default.
           claude_args: ${{ inputs.claude-args }} --max-turns ${{ inputs.max-turns }}
           show_full_output: ${{ inputs.show-full-output }}
           # Bypass flaky GitHub API permission-check (504 timeout from self-hosted K8s runner).
@@ -476,6 +484,27 @@ jobs:
             | tail -1 || true)"
 
           if [ -z "$MARKER_LINE" ]; then
+            # Additiver Fallback (Issue #68): Kein Marker im jüngsten Bot-Review/-Comment,
+            # ABER der Bot hat den PR explizit per Review-State=APPROVED freigegeben →
+            # als CLEAN werten. Fängt den Fall ab, dass der Review-Step den Marker nicht
+            # zuverlässig emittiert (Action-Flakiness), obwohl der Bot approved hat.
+            # Der konservative BLOCKED-Default bleibt für den Fall GAR KEINES positiven
+            # Signals (kein Marker UND kein APPROVE) vollständig erhalten.
+            BOT_STATE="$(gh api --paginate "repos/${REPO}/pulls/${PR}/reviews" \
+              --jq '[.[] | select(.user.login == "github-actions[bot]")] | sort_by(.submitted_at // .created_at // "") | last | .state // ""' \
+              2>/dev/null || true)"
+            if [ "$BOT_STATE" = "APPROVED" ]; then
+              echo "Kein Marker, aber Bot-Review-State=APPROVED — Fallback auf CLEAN (Issue #68)."
+              {
+                echo "## Claude-Review Merge-Gate"
+                echo ""
+                echo "**Verdikt:** CLEAN (Fallback)"
+                echo ""
+                echo "Kein \`REVIEW_VERDICT\`-Marker gefunden, aber der Bot hat den PR per"
+                echo "Review-State \`APPROVED\` freigegeben (Issue #68: additiver Fallback)."
+              } >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
             echo "Kein gültiger REVIEW_VERDICT-Marker gefunden — konservativ BLOCKED."
             {
               echo "## Claude-Review Merge-Gate"

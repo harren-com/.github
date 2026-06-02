@@ -64,7 +64,10 @@ on:
 jobs:
   claude-review:
     runs-on: ${{ inputs.runs-on }}
-    timeout-minutes: 20
+    # Job-Timeout (Issue #28): von 20 auf 24 angehoben, um Platz für zwei
+    # 10-min-Agent-Versuche (run_review + run_review_retry) plus Overhead aus
+    # Checkout/Reconcile/Sticky/Gate (~3 min) zu schaffen.
+    timeout-minutes: 24
 
     steps:
       - name: Install dependencies
@@ -307,6 +310,13 @@ jobs:
         # greift. Der Gate-Step unten (if: always()) bleibt der alleinige Entscheider
         # über den claude-review-Check — entkoppelt vom Action-Step-Outcome.
         continue-on-error: true
+        # Step-Timeout (Issue #28): Frühe Hang-Erkennung. Ein transienter Agent-Hang
+        # (blockierender erster Anthropic-API-Call oder MCP-Init ohne client-seitiges
+        # Timeout) lief bisher bis ans Job-Limit (20 min) durch (Vorfall super-human-prep#88).
+        # Mit diesem Step-Timeout wird ein Hang nach 10 min abgebrochen; da der Step
+        # continue-on-error: true hat, wird der Job NICHT hart rot — der Step-outcome
+        # wird 'failure', was den Retry-Step unten triggert.
+        timeout-minutes: 10
         uses: anthropics/claude-code-action@v1
         env:
           # claude-code-action v2.1+ installiert bubblewrap (bwrap) für Subprocess-Isolation
@@ -334,6 +344,35 @@ jobs:
           show_full_output: ${{ inputs.show-full-output }}
           # Bypass flaky GitHub API permission-check (504 timeout from self-hosted K8s runner).
           # Owner-repos only — safe as long as this workflow is org-internal.
+          allowed_non_write_users: ${{ inputs.allowed-non-write-users }}
+
+      - name: Run Claude Code Review (retry on hang/crash)
+        id: run_review_retry
+        # Automatischer Retry (Issue #28): Läuft NUR, wenn der erste Agent-Lauf
+        # fehlschlug/timeoutete (steps.run_review.outcome == 'failure') — also bei
+        # einem transienten Hang oder Tool-/Sandbox-Crash, der per Re-Run sofort
+        # behebbar ist (Vorfall super-human-prep#88).
+        #
+        # Korrektheit der Bedingung (kritisch): outcome == 'failure' ⟺ die Action
+        # selbst schlug fehl/timeoutete. Ein legitimes BLOCKED-Verdikt entsteht
+        # dagegen bei einem ERFOLGREICHEN Agent-Lauf (outcome == 'success'), den der
+        # nachgelagerte Gate-Step bewertet — das triggert hier KEINEN Retry. Damit
+        # retryt der Workflow transiente Hänger, aber niemals ein inhaltliches BLOCKED.
+        #
+        # env/with sind 1:1 identisch zum run_review-Step oben (derselbe Review).
+        if: steps.run_review.outcome == 'failure'
+        continue-on-error: true
+        timeout-minutes: 10
+        uses: anthropics/claude-code-action@v1
+        env:
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '0'
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          prompt: ${{ env.FULL_PROMPT }}
+          claude_args: ${{ inputs.claude-args }} --max-turns ${{ inputs.max-turns }}
+          show_full_output: ${{ inputs.show-full-output }}
           allowed_non_write_users: ${{ inputs.allowed-non-write-users }}
 
       - name: Persist round verdict (sticky issue comment, audit trail)

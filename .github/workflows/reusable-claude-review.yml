@@ -64,10 +64,10 @@ on:
 jobs:
   claude-review:
     runs-on: ${{ inputs.runs-on }}
-    # Job-Timeout (Issue #28): von 20 auf 24 angehoben, um Platz für zwei
-    # 10-min-Agent-Versuche (run_review + run_review_retry) plus Overhead aus
-    # Checkout/Reconcile/Sticky/Gate (~3 min) zu schaffen.
-    timeout-minutes: 24
+    # Job-Timeout (Issue #30): von 24 auf 50 angehoben — zwei 18-min-Agent-Versuche
+    # (run_review + run_review_retry, jeweils 10→18 min) plus Emit-Marker-Step
+    # (max 5 min) plus Overhead Checkout/Reconcile/Sticky/Gate (~5 min).
+    timeout-minutes: 50
 
     steps:
       - name: Install dependencies
@@ -310,13 +310,15 @@ jobs:
         # greift. Der Gate-Step unten (if: always()) bleibt der alleinige Entscheider
         # über den claude-review-Check — entkoppelt vom Action-Step-Outcome.
         continue-on-error: true
-        # Step-Timeout (Issue #28): Frühe Hang-Erkennung. Ein transienter Agent-Hang
-        # (blockierender erster Anthropic-API-Call oder MCP-Init ohne client-seitiges
-        # Timeout) lief bisher bis ans Job-Limit (20 min) durch (Vorfall super-human-prep#88).
-        # Mit diesem Step-Timeout wird ein Hang nach 10 min abgebrochen; da der Step
-        # continue-on-error: true hat, wird der Job NICHT hart rot — der Step-outcome
-        # wird 'failure', was den Retry-Step unten triggert.
-        timeout-minutes: 10
+        # Step-Timeout (Issue #30): von 10 auf 18 min angehoben. Beleg aus
+        # claude-dotfiles#86 (großer Diff +2545/−42): Versuch 1 lief 445s (~7,5 min)
+        # und beendete sich mit outcome=success, aber ohne REVIEW_VERDICT-Marker —
+        # das Modell hat den Marker bei großem Output vergessen/abgeschnitten, bevor
+        # der Agent-Loop endete. Versuch 2 lief 612s (~10,2 min) und schlug am alten
+        # Cap an. 18 min gibt dem Modell bei großen Diffs den nötigen Headroom, ohne
+        # den Job-Timeout zu sprengen. Hänger werden vom Emit-Marker-Step (Issue #30)
+        # und dem Gate abgefangen.
+        timeout-minutes: 18
         uses: anthropics/claude-code-action@v1
         env:
           # claude-code-action v2.1+ installiert bubblewrap (bwrap) für Subprocess-Isolation
@@ -360,9 +362,11 @@ jobs:
         # retryt der Workflow transiente Hänger, aber niemals ein inhaltliches BLOCKED.
         #
         # env/with sind 1:1 identisch zum run_review-Step oben (derselbe Review).
+        # Step-Timeout (Issue #30): ebenfalls von 10 auf 18 min angehoben (symmetrisch
+        # zum run_review-Step).
         if: steps.run_review.outcome == 'failure'
         continue-on-error: true
-        timeout-minutes: 10
+        timeout-minutes: 18
         uses: anthropics/claude-code-action@v1
         env:
           CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '0'
@@ -374,6 +378,137 @@ jobs:
           claude_args: ${{ inputs.claude-args }} --max-turns ${{ inputs.max-turns }}
           show_full_output: ${{ inputs.show-full-output }}
           allowed_non_write_users: ${{ inputs.allowed-non-write-users }}
+
+      - name: Emit REVIEW_VERDICT marker (post-review, Issue #30)
+        # Kern-Fix für Issue #30: Verdikt-Emit vom langen Review-Lauf entkoppeln.
+        #
+        # Root Cause (verifiziert claude-dotfiles#86, run 26933091794):
+        #   Versuch 1 (445s, outcome=success): Modell schrieb Findings + Summary,
+        #   aber vergaß/schnitt den REVIEW_VERDICT-Marker ab (Output-/Turn-Grenze).
+        #   Versuch 2 (612s): schlug am 10-min-Cap an.
+        #   Gate: kein Marker → konservativ BLOCKED.
+        #
+        # Fix-Ansatz: Dieser Step läuft NACH dem Review-Lauf (if: always()) mit
+        # einem minimalen Einzel-Turn-Prompt. Er liest die bereits geposteten
+        # Bot-Review-Bodies + Issue-Comments des aktuellen PR, extrahiert daraus
+        # das inhaltliche Ergebnis (Counts offener [BLOCKER]/[WARNING]) und gibt
+        # NUR den REVIEW_VERDICT-Marker in einem neuen Issue-Comment aus.
+        # Minimaler Token-Bedarf → Marker kann nicht vergessen/abgeschnitten werden.
+        #
+        # Idempotenz: Der Step prüft zuerst, ob bereits ein gültiger Marker in den
+        # jüngsten Bot-Kommentaren vorhanden ist. Existiert einer, überspringt er
+        # den API-Call (kein zweiter Marker, keine Konfusion im Gate).
+        #
+        # Gate-Kompatibilität: Der Gate-Step liest ohnehin ALLE Bot-Review-Bodies
+        # UND Issue-Comments paginiert — der neue Issue-Comment wird von ihm
+        # automatisch als Quelle miterfasst (nach Zeitstempel sortiert, jüngster
+        # gewinnt). Keine Änderung am Gate nötig.
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: '0'
+        run: |
+          set -uo pipefail
+          PR="${GITHUB_REF#refs/pull/}"
+          PR="${PR%/merge}"
+          REPO="${GITHUB_REPOSITORY}"
+          if ! [[ "$PR" =~ ^[0-9]+$ ]]; then
+            echo "Keine PR-Nr ableitbar — überspringe Emit-Marker-Step."
+            exit 0
+          fi
+
+          # Schritt 1: Prüfen ob bereits ein gültiger Marker existiert.
+          # Wenn ja: Step überspringen (idempotent).
+          : > /tmp/emit-check.txt
+          gh api --paginate "repos/${REPO}/pulls/${PR}/reviews" \
+            --jq '.[] | select(.user.login == "github-actions[bot]") | .body // ""' \
+            >> /tmp/emit-check.txt 2>/dev/null || true
+          gh api --paginate "repos/${REPO}/issues/${PR}/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]") | .body // ""' \
+            >> /tmp/emit-check.txt 2>/dev/null || true
+
+          if grep -q '<!-- REVIEW_VERDICT:' /tmp/emit-check.txt 2>/dev/null; then
+            echo "REVIEW_VERDICT-Marker bereits vorhanden — kein Emit nötig."
+            exit 0
+          fi
+
+          echo "Kein REVIEW_VERDICT-Marker gefunden — starte Emit-Lauf."
+
+          # Schritt 2: Alle Bot-Findings aus diesem PR-Lauf als Kontext sammeln.
+          # Wir schreiben den Kontext in eine Datei und übergeben ihn per Prompt.
+          FINDINGS_FILE="/tmp/emit-findings.txt"
+          : > "$FINDINGS_FILE"
+          gh api --paginate "repos/${REPO}/pulls/${PR}/reviews" \
+            --jq '.[] | select(.user.login == "github-actions[bot]") | "=== Review (submitted: \(.submitted_at // "?")) ===\n\(.body // "")\n"' \
+            >> "$FINDINGS_FILE" 2>/dev/null || true
+          gh api --paginate "repos/${REPO}/pulls/${PR}/comments" \
+            --jq '.[] | select(.user.login == "github-actions[bot]") | "=== Inline-Comment (path: \(.path // "?"), line: \(.line // "?")) ===\n\(.body // "")\n"' \
+            >> "$FINDINGS_FILE" 2>/dev/null || true
+
+          FINDINGS="$(cat "$FINDINGS_FILE")"
+          if [ -z "$FINDINGS" ]; then
+            FINDINGS="(Keine Bot-Review-Bodies oder Inline-Comments auf diesem PR gefunden.)"
+          fi
+
+          # Schritt 3: Minimaler Einzel-Turn-Prompt — NUR Verdikt-Marker ausgeben.
+          # Bewusst keine claude-code-action (Overhead), sondern direkter claude-Aufruf
+          # mit --max-turns 1. Damit ist das Output-Budget minimal und der Marker
+          # kann nicht abgeschnitten werden.
+          cat > /tmp/emit-marker-prompt.txt << 'EMITPROMPT'
+          Du bist der deterministische Verdikt-Emitter eines Code-Review-Workflows.
+
+          Dir werden unten die bereits geposteten Review-Bodies und Inline-Comments
+          des github-actions[bot] für diesen PR gezeigt. Das inhaltliche Review wurde
+          bereits vollständig durchgeführt — du musst NICHTS erneut reviewen.
+
+          Deine einzige Aufgabe: Zähle aus den unten stehenden Findings die noch
+          offenen [BLOCKER] und [WARNING], und gib GENAU EINE Zeile aus — den
+          maschinenlesbaren REVIEW_VERDICT-Marker im exakten Format:
+
+              <!-- REVIEW_VERDICT: status=BLOCKED|CLEAN blockers=<n> warnings=<n> round=<n> -->
+
+          Regeln:
+          - status=BLOCKED wenn offene [BLOCKER] > 0 ODER offene [WARNING] > 0, sonst status=CLEAN.
+          - blockers=<n>: Anzahl offener (nicht als [RESOLVED] markierter) [BLOCKER].
+          - warnings=<n>: Anzahl offener (nicht als [RESOLVED] markierter) [WARNING].
+          - round=<n>: höchste Rundennummer aus den Review-Bodies (oder 1 falls unklar).
+          - Gib NUR diese eine Marker-Zeile aus. Kein erklärender Text davor oder danach.
+          - Kein Markdown-Codeblock drumherum. Nur die rohe HTML-Kommentar-Zeile.
+
+          Wenn kein einziges [BLOCKER] oder [WARNING] sichtbar ist → status=CLEAN blockers=0 warnings=0.
+          EMITPROMPT
+
+          # Füge die gesammelten Findings an den Prompt an.
+          printf '\n\n--- Gesammelte Review-Findings dieses PR-Laufs ---\n\n' >> /tmp/emit-marker-prompt.txt
+          cat "$FINDINGS_FILE" >> /tmp/emit-marker-prompt.txt
+
+          # claude mit --max-turns 1 aufrufen. Wir brauchen nur einen einzigen Turn.
+          # Timeout: 5 Minuten — mehr als genug für einen einzelnen API-Call.
+          MARKER_OUTPUT="$(timeout 300 claude --max-turns 1 --print < /tmp/emit-marker-prompt.txt 2>/dev/null || true)"
+
+          # Bereinigen: nur die Zeile mit dem Marker extrahieren.
+          MARKER_LINE="$(echo "$MARKER_OUTPUT" | grep -o '<!-- REVIEW_VERDICT:[^>]*-->' | head -1 || true)"
+
+          if [ -z "$MARKER_LINE" ]; then
+            echo "WARN: Emit-Lauf hat keinen gültigen Marker produziert — Gate-Fallback greift."
+            exit 0
+          fi
+
+          echo "Emit-Lauf: Marker erzeugt: $MARKER_LINE"
+
+          # Marker als Issue-Comment posten (Gate liest Issue-Comments als zweite Quelle).
+          NOW="$(date -u +'%Y-%m-%dT%H:%M:%SZ')"
+          cat > /tmp/emit-comment.md << EMITCOMMENT
+          <!-- REVIEW_VERDICT_EMIT: auto-emitted by post-review step (Issue #30) at ${NOW} -->
+
+          ${MARKER_LINE}
+          EMITCOMMENT
+
+          gh api -X POST "repos/${REPO}/issues/${PR}/comments" \
+            -F body=@/tmp/emit-comment.md >/dev/null 2>&1 \
+            && echo "Emit-Marker-Comment gepostet." \
+            || echo "WARN: Emit-Comment-POST fehlgeschlagen (non-fatal — Gate nutzt Fallback)."
 
       - name: Persist round verdict (sticky issue comment, audit trail)
         # Persistenter Verdikt-Sticky (Issue #21):

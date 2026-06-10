@@ -1,0 +1,255 @@
+name: Reusable — Prod-Identical Smoke Gate
+
+# ---------------------------------------------------------------------------
+# Cluster-first CI-Paritaet (Issue #309, DFL-Retro Hebel #2: "lokal gruen /
+# Cluster rot").
+#
+# Adressiert genau die Schmerzpunkte der DFL-Kollaboration:
+#   - venv-Shebang-Bug (/build/.venv -> /app/.venv, CrashLoopBackOff): das Gate
+#     baut das EXAKT GLEICHE Image wie das Deployment (gleicher Build-Context,
+#     gleiches Dockerfile, gleiches Base-Image) und STARTET den Container. Ein
+#     kaputtes venv-Shebang fuehrt dann sofort zu einem nicht-startenden
+#     Container -> Gate FAILT, statt erst im Cluster zu crashen.
+#   - MCP-Transport-Pivot stdio->HTTP (#66): das Gate startet den Container im
+#     prod-Transport (HTTP/SSE) und fuehrt einen echten End-to-End-Smoke
+#     (Health-Endpoint + optionaler MCP-Handshake) aus — NICHT nur "exit 0".
+#
+# Aufruf (cross-repo) aus einem Consumer-Repo:
+#
+#   jobs:
+#     prod-smoke:
+#       uses: harren-com/.github/.github/workflows/reusable-prod-smoke.yml@main
+#       with:
+#         runs-on: <docker-faehiges-label>   # Pflicht — Runner-Anforderung unten
+#         health-port: 8765
+#         serve-args: 'serve --transport sse --host 0.0.0.0 --port 8765'
+#
+# WICHTIG — Runner-Anforderung: Dieses Gate baut UND startet einen Container und
+# braucht einen Docker-faehigen Runner. Die Org-`shared-runners` (ARC, PSS-
+# restricted, kein DinD) koennen das NICHT (im #309-CI verifiziert: newuidmap
+# darf uid_map nicht schreiben). Setze `runs-on` auf ein DinD-Set oder einen
+# GitHub-hosted Runner. Platzierungs-/Engine-Entscheidung (ADR): https://github.com/harren-com/cloud-dev-environment/blob/main/docs/ci-prod-smoke-gate.md.
+# ---------------------------------------------------------------------------
+
+on:
+  workflow_call:
+    inputs:
+      dockerfile:
+        description: 'Pfad zum Dockerfile (prod-identisch — derselbe wie im Deploy-Build)'
+        type: string
+        default: 'Dockerfile'
+      build-context:
+        description: 'Docker build context (prod-identisch)'
+        type: string
+        default: '.'
+      build-target:
+        description: 'Optionales Build-Stage-Target (leer = letztes Stage)'
+        type: string
+        default: ''
+      health-port:
+        description: 'Container-Port, auf dem der Health/MCP-Endpoint lauscht'
+        type: string
+        default: '8765'
+      health-path:
+        description: 'HTTP-Pfad des Health-Endpoints'
+        type: string
+        default: '/health'
+      serve-args:
+        description: >-
+          Argumente, die an den Container-Entrypoint angehaengt werden, um den
+          PROD-Transport zu fahren (z.B. HTTP/SSE statt stdio). Leer = Default-CMD.
+        type: string
+        default: ''
+      mcp-path:
+        description: >-
+          Optionaler MCP-Endpoint-Pfad fuer einen Handshake-Probe (z.B. /mcp).
+          Leer = MCP-Handshake-Schritt wird uebersprungen.
+        type: string
+        default: ''
+      container-env:
+        description: >-
+          Optionale, durch Zeilen getrennte ENV-Zuweisungen fuer den Container
+          (KEY=VALUE pro Zeile) — z.B. um Transport/Pfade prod-identisch zu setzen.
+        type: string
+        default: ''
+      startup-timeout-seconds:
+        description: 'Max. Sekunden, die auf einen gesunden Container gewartet wird'
+        type: string
+        default: '60'
+      runs-on:
+        description: >-
+          Runner-Label. ACHTUNG: Dieses Gate baut UND startet einen Container und
+          braucht daher einen Docker-faehigen Runner (laufender Docker-Daemon).
+          Die Org-`shared-runners` (ARC, PSS-restricted, kein DinD) koennen das
+          NICHT — siehe https://github.com/harren-com/cloud-dev-environment/blob/main/docs/ci-prod-smoke-gate.md "Runner-Anforderung". Setze hier
+          einen DinD-RunnerScaleSet oder (Konventions-Ausnahme) einen GitHub-hosted
+          Runner.
+        type: string
+        default: 'shared-runners'
+
+jobs:
+  prod-smoke:
+    name: Prod-Identical Smoke
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+
+    # Engine: DOCKER. Das Gate baut UND startet einen Container — das braucht einen
+    # laufenden Docker-Daemon auf dem Runner (`inputs.runs-on`). Die Org-`shared-
+    # runners` (ARC, PSS-restricted, cap-drop ALL) koennen das NICHT: kein DinD,
+    # und der unprivilegierte Rootless-Pfad scheitert an `newuidmap` (uid_map write
+    # "Operation not permitted", #309-CI-Befund). Deshalb ist `runs-on` ein Input
+    # — Consumer setzen einen DinD-RunnerScaleSet oder GitHub-hosted Runner.
+    # Details + Entscheidung: https://github.com/harren-com/cloud-dev-environment/blob/main/docs/ci-prod-smoke-gate.md "Runner-Anforderung".
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify Docker daemon availability
+        env:
+          RUNS_ON: ${{ inputs.runs-on }}
+        run: |
+          set -euo pipefail
+          if ! docker info >/dev/null 2>&1; then
+            echo "::error::Kein laufender Docker-Daemon auf '${RUNS_ON}'. Dieses Gate baut+startet Container und braucht einen Docker-faehigen Runner (DinD-Set oder GitHub-hosted). Siehe https://github.com/harren-com/cloud-dev-environment/blob/main/docs/ci-prod-smoke-gate.md."
+            exit 1
+          fi
+          docker version
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Prod-identischer Build: gleiches Dockerfile, gleicher Context, gleiches
+      # Base-Image. Als lokales Tag geladen (kein Push) — das Gate testet das
+      # Artefakt, es deployt nichts.
+      - name: Build prod-identical image
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.build-context }}
+          file: ${{ inputs.dockerfile }}
+          target: ${{ inputs.build-target }}
+          load: true
+          tags: prod-smoke-candidate:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Start container in prod transport
+        env:
+          CONTAINER_ENV: ${{ inputs.container-env }}
+          HEALTH_PORT: ${{ inputs.health-port }}
+          SERVE_ARGS: ${{ inputs.serve-args }}
+        run: |
+          set -euo pipefail
+
+          # ENV-Zeilen in -e Flags uebersetzen.
+          ENV_FLAGS=()
+          if [ -n "${CONTAINER_ENV}" ]; then
+            while IFS= read -r line; do
+              [ -z "$line" ] && continue
+              ENV_FLAGS+=("-e" "$line")
+            done <<< "${CONTAINER_ENV}"
+          fi
+
+          echo "Starte Container im Prod-Transport (Port ${HEALTH_PORT})..."
+          # shellcheck disable=SC2086
+          docker run -d --name prod-smoke \
+            -p "${HEALTH_PORT}:${HEALTH_PORT}" \
+            "${ENV_FLAGS[@]}" \
+            prod-smoke-candidate:ci ${SERVE_ARGS}
+
+          echo "Container-ID: $(docker ps -q -f name=prod-smoke)"
+
+      - name: Wait for service to become healthy
+        env:
+          HEALTH_PORT: ${{ inputs.health-port }}
+          HEALTH_PATH: ${{ inputs.health-path }}
+          STARTUP_TIMEOUT: ${{ inputs.startup-timeout-seconds }}
+        run: |
+          set -euo pipefail
+          DEADLINE=$(( $(date +%s) + ${STARTUP_TIMEOUT} ))
+          URL="http://localhost:${HEALTH_PORT}${HEALTH_PATH}"
+          echo "Warte auf Health-Endpoint: ${URL}"
+
+          while true; do
+            # Container darf nicht zwischenzeitlich crashen (venv-Shebang-Bug-Detektor).
+            STATE=$(docker inspect -f '{{.State.Status}}' prod-smoke 2>/dev/null || echo "gone")
+            if [ "$STATE" != "running" ]; then
+              echo "::error::Container ist nicht mehr 'running' (Status: ${STATE}) — Start fehlgeschlagen."
+              echo "=== docker logs ==="
+              docker logs prod-smoke || true
+              exit 1
+            fi
+
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 "${URL}" || echo "000")
+            if [ "$CODE" = "200" ]; then
+              echo "Health-Endpoint antwortet mit HTTP 200 — Service ist up."
+              break
+            fi
+
+            if [ "$(date +%s)" -ge "$DEADLINE" ]; then
+              echo "::error::Timeout — Health-Endpoint wurde nicht innerhalb von ${STARTUP_TIMEOUT}s gesund (letzter Code: ${CODE})."
+              echo "=== docker logs ==="
+              docker logs prod-smoke || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+      - name: MCP handshake probe
+        if: inputs.mcp-path != ''
+        env:
+          HEALTH_PORT: ${{ inputs.health-port }}
+          MCP_PATH: ${{ inputs.mcp-path }}
+        run: |
+          set -euo pipefail
+          # Echter MCP-Handshake: initialize-Request via JSON-RPC. Erwartet eine
+          # Antwort mit serverInfo (NICHT nur HTTP 200) — adressiert den
+          # stdio->HTTP-Transport-Pivot (#66): ein falsch konfigurierter Transport
+          # antwortet zwar evtl. auf /health, aber nicht auf den MCP-Handshake.
+          URL="http://localhost:${HEALTH_PORT}${MCP_PATH}"
+          echo "MCP-Handshake gegen: ${URL}"
+
+          REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci-smoke","version":"1.0"}}}'
+
+          RESP=$(curl -s --max-time 5 \
+            -H 'Content-Type: application/json' \
+            -H 'Accept: application/json, text/event-stream' \
+            -X POST "${URL}" -d "${REQ}" || true)
+
+          echo "MCP-Antwort: ${RESP}"
+
+          # SSE- oder JSON-Antwort: in beiden Faellen muss 'serverInfo' oder
+          # 'result' / 'protocolVersion' enthalten sein.
+          if echo "${RESP}" | grep -qE 'serverInfo|protocolVersion|"result"'; then
+            echo "MCP-Handshake erfolgreich beantwortet."
+          else
+            echo "::error::MCP-Handshake lieferte keine gueltige initialize-Antwort."
+            echo "=== docker logs ==="
+            docker logs prod-smoke || true
+            exit 1
+          fi
+
+      - name: Smoke summary
+        if: always()
+        env:
+          HEALTH_PATH: ${{ inputs.health-path }}
+          MCP_PATH: ${{ inputs.mcp-path }}
+        run: |
+          {
+            echo "## Prod-Identical Smoke Gate"
+            echo ""
+            echo "| Check | Status |"
+            echo "|---|---|"
+            echo "| Image-Build (prod-identisch) | ${{ job.status == 'success' && '✅' || '⚠️' }} |"
+            echo "| Container-Start (Prod-Transport) | siehe Schritte |"
+            echo "| Health-Endpoint \`${HEALTH_PATH}\` | siehe Schritte |"
+            if [ -n "${MCP_PATH}" ]; then
+              echo "| MCP-Handshake \`${MCP_PATH}\` | siehe Schritte |"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Teardown
+        if: always()
+        run: |
+          docker rm -f prod-smoke >/dev/null 2>&1 || true

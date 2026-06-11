@@ -1,29 +1,46 @@
 name: Reusable — Security Scan
+# Org-weiter reusable Security-Workflow.
+# Enthält: pip-audit, bandit, TruffleHog, Trivy fs/config/image, npm audit, SBOM.
+# Alle Jobs laufen auf dem konfigurierbaren Runner-Input (Standard: shared-runners).
+# Trivy-Image-Scan ist opt-in via inputs.image-ref + inputs.docker-runner.
+# Bestehende Caller (stock-scoring, ibkr_to_datev) laufen ohne Änderung weiter.
 
 on:
   workflow_call:
     inputs:
       python-version:
-        description: 'Python version to use'
+        description: 'Python-Version für pip-audit/bandit'
         type: string
         default: '3.12'
       requirements-files:
-        description: 'Space-separated list of requirements files to install'
+        description: 'Leerzeichen-getrennte Liste von requirements-Dateien'
         type: string
         default: 'requirements.txt requirements-dev.txt'
       bandit-target:
-        description: 'Directory to scan with bandit'
+        description: 'Verzeichnis für bandit-Scan'
         type: string
         default: 'src/'
       ignore-vulns:
-        description: 'Space-separated CVE/GHSA IDs to ignore in pip-audit (e.g. GHSA-rf74-v2fm-23pw)'
+        description: 'Leerzeichen-getrennte CVE/GHSA-IDs, die in pip-audit ignoriert werden'
+        type: string
+        default: ''
+      runs-on:
+        description: 'Runner-Label (Standard: shared-runners — NIE self-hosted oder ubuntu-latest)'
+        type: string
+        default: 'shared-runners'
+      image-ref:
+        description: 'Container-Image für Trivy-Image-Scan (opt-in, leer = überspringen)'
+        type: string
+        default: ''
+      docker-runner:
+        description: 'Runner-Label mit Docker-Daemon für Trivy-Image-Scan (opt-in, leer = überspringen)'
         type: string
         default: ''
 
 jobs:
   python-security:
     name: Python Security Scan
-    runs-on: shared-runners
+    runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 10
 
     steps:
@@ -47,13 +64,21 @@ jobs:
       - name: Install security tools
         run: |
           python -m pip install --upgrade pip
-          # Note: safety intentionally excluded — it pulls in nltk (CVE-ridden) and is
-          # redundant with pip-audit which already covers OSV/PyPI Advisory Database.
+          # Hinweis: safety bewusst ausgelassen — zieht nltk (CVE-belastet) und ist
+          # redundant zu pip-audit (OSV/PyPI Advisory Database).
           pip install pip-audit bandit
 
       - name: Install project dependencies
         run: |
-          for f in ${{ inputs.requirements-files }}; do pip install -r $f; done
+          # Datei-Guard: Nicht-Python-Repos (Shell/Terraform) haben keine requirements-Dateien —
+          # pip-audit scannt dann nur die (leere) Umgebung statt den Job rot zu machen.
+          for f in ${{ inputs.requirements-files }}; do
+            if [ -f "$f" ]; then
+              pip install -r "$f"
+            else
+              echo "Übersprungen: $f nicht vorhanden"
+            fi
+          done
 
       - name: Run pip-audit (CVE scanning)
         run: |
@@ -76,7 +101,7 @@ jobs:
 
   secrets-scan:
     name: Secrets Scanning
-    runs-on: shared-runners
+    runs-on: ${{ inputs.runs-on }}
     timeout-minutes: 10
 
     steps:
@@ -101,10 +126,222 @@ jobs:
           path: ./
           extra_args: --only-verified
 
+  trivy-fs:
+    name: Trivy Filesystem-Scan (vuln + secret)
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Trivy installieren (v0.71.0, kein Docker-Daemon nötig)
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/v0.71.0/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin v0.71.0
+          trivy --version
+
+      - name: Trivy fs-Scan — CRITICAL/HIGH-Gate
+        run: |
+          trivy fs \
+            --scanners vuln,secret \
+            --severity CRITICAL,HIGH \
+            --exit-code 1 \
+            --format table \
+            .
+
+      - name: Trivy fs-Scan — Vollständiger Report (alle Severities) für Summary
+        if: always()
+        run: |
+          echo "## Trivy Filesystem-Scan — Vollständiger Report" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          trivy fs \
+            --scanners vuln,secret \
+            --severity CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN \
+            --exit-code 0 \
+            --format table \
+            . >> $GITHUB_STEP_SUMMARY 2>&1 || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  trivy-config:
+    name: Trivy Config-Scan (Dockerfiles, Terraform, K8s-Manifeste)
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Relevante Konfigurationsdateien erkennen
+        id: detect
+        run: |
+          # Suche nach Dockerfiles, Terraform-Dateien und K8s/sonstigen YAMLs außerhalb von .github
+          FOUND=$(find . \( -name 'Dockerfile*' -o -name '*.tf' -o -name '*.yaml' -o -name '*.yml' \) \
+            | grep -v '^\./.github' \
+            | head -1 || true)
+          if [ -z "$FOUND" ]; then
+            echo "has_config=false" >> $GITHUB_OUTPUT
+            echo "Keine Konfigurationsdateien gefunden — Trivy config-Scan übersprungen."
+          else
+            echo "has_config=true" >> $GITHUB_OUTPUT
+            echo "Konfigurationsdateien gefunden: $FOUND (und ggf. weitere)"
+          fi
+
+      - name: Trivy installieren (v0.71.0)
+        if: steps.detect.outputs.has_config == 'true'
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/v0.71.0/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin v0.71.0
+          trivy --version
+
+      - name: Trivy config-Scan — CRITICAL/HIGH-Gate
+        if: steps.detect.outputs.has_config == 'true'
+        run: |
+          trivy config \
+            --severity CRITICAL,HIGH \
+            --exit-code 1 \
+            --format table \
+            .
+
+      - name: Trivy config-Scan — Vollständiger Report für Summary
+        if: steps.detect.outputs.has_config == 'true' && always()
+        run: |
+          echo "## Trivy Config-Scan — Vollständiger Report" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          trivy config \
+            --severity CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN \
+            --exit-code 0 \
+            --format table \
+            . >> $GITHUB_STEP_SUMMARY 2>&1 || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Config-Scan übersprungen — Hinweis in Summary
+        if: steps.detect.outputs.has_config == 'false'
+        run: |
+          echo "## Trivy Config-Scan" >> $GITHUB_STEP_SUMMARY
+          echo "Übersprungen — keine Dockerfiles, Terraform- oder K8s-Manifest-Dateien gefunden." >> $GITHUB_STEP_SUMMARY
+
+  npm-audit:
+    name: npm audit
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: package.json erkennen
+        id: detect
+        run: |
+          if [ -f "package.json" ]; then
+            echo "has_package_json=true" >> $GITHUB_OUTPUT
+            echo "package.json gefunden — npm audit wird ausgeführt."
+          else
+            echo "has_package_json=false" >> $GITHUB_OUTPUT
+            echo "Kein package.json — npm audit übersprungen."
+          fi
+
+      - name: npm-Lockfile prüfen
+        if: steps.detect.outputs.has_package_json == 'true'
+        id: lockfile
+        run: |
+          if [ -f "package-lock.json" ] || [ -f "yarn.lock" ] || [ -f "pnpm-lock.yaml" ]; then
+            echo "has_lockfile=true" >> $GITHUB_OUTPUT
+          else
+            echo "has_lockfile=false" >> $GITHUB_OUTPUT
+            echo "Kein Lockfile gefunden — npm audit kann keine zuverlässigen Ergebnisse liefern."
+            echo "## npm audit" >> $GITHUB_STEP_SUMMARY
+            echo "Übersprungen — kein Lockfile (package-lock.json / yarn.lock / pnpm-lock.yaml) gefunden." >> $GITHUB_STEP_SUMMARY
+            echo "npm audit ohne Lockfile ist unzuverlässig. Bitte Lockfile committen." >> $GITHUB_STEP_SUMMARY
+          fi
+
+      - name: npm audit ausführen
+        if: steps.detect.outputs.has_package_json == 'true' && steps.lockfile.outputs.has_lockfile == 'true'
+        run: |
+          npm audit --audit-level=high
+
+      - name: npm audit übersprungen — Hinweis in Summary
+        if: steps.detect.outputs.has_package_json == 'false'
+        run: |
+          echo "## npm audit" >> $GITHUB_STEP_SUMMARY
+          echo "Übersprungen — kein package.json im Repository gefunden." >> $GITHUB_STEP_SUMMARY
+
+  trivy-image:
+    name: Trivy Image-Scan (opt-in)
+    # Läuft nur wenn image-ref UND docker-runner explizit gesetzt sind.
+    # Caller mit Docker-Build: image-ref: 'ghcr.io/...' + docker-runner: 'dind-runners'
+    if: inputs.image-ref != '' && inputs.docker-runner != ''
+    runs-on: ${{ inputs.docker-runner }}
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Docker-Login ghcr.io
+        run: echo "${{ github.token }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Trivy installieren (v0.71.0)
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/v0.71.0/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin v0.71.0
+          trivy --version
+
+      - name: Trivy image-Scan — CRITICAL/HIGH-Gate
+        run: |
+          trivy image \
+            --scanners vuln,secret \
+            --severity CRITICAL,HIGH \
+            --exit-code 1 \
+            --format table \
+            ${{ inputs.image-ref }}
+
+      - name: Trivy image-Scan — Vollständiger Report für Summary
+        if: always()
+        run: |
+          echo "## Trivy Image-Scan: ${{ inputs.image-ref }}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          trivy image \
+            --scanners vuln,secret \
+            --severity CRITICAL,HIGH,MEDIUM,LOW,UNKNOWN \
+            --exit-code 0 \
+            --format table \
+            ${{ inputs.image-ref }} >> $GITHUB_STEP_SUMMARY 2>&1 || true
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+  sbom:
+    name: SBOM generieren (CycloneDX)
+    runs-on: ${{ inputs.runs-on }}
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Trivy installieren (v0.71.0)
+        run: |
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/v0.71.0/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin v0.71.0
+          trivy --version
+
+      - name: SBOM erzeugen (CycloneDX)
+        run: |
+          trivy fs \
+            --format cyclonedx \
+            --output sbom.cdx.json \
+            .
+
+      - name: SBOM als Artifact hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-cyclonedx
+          path: sbom.cdx.json
+          retention-days: 90
+
   security-summary:
     name: Security Scan Summary
-    runs-on: shared-runners
-    needs: [python-security, secrets-scan]
+    runs-on: ${{ inputs.runs-on }}
+    needs: [python-security, secrets-scan, trivy-fs, trivy-config, npm-audit, sbom]
     if: always()
 
     steps:
@@ -112,13 +349,19 @@ jobs:
         run: |
           echo "# Security Scan Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          if [ "${{ needs.python-security.result }}" == "success" ]; then
-            echo "- Python Security: PASSED" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- Python Security: FAILED" >> $GITHUB_STEP_SUMMARY
-          fi
-          if [ "${{ needs.secrets-scan.result }}" == "success" ]; then
-            echo "- Secrets Scan: PASSED" >> $GITHUB_STEP_SUMMARY
-          else
-            echo "- Secrets Scan: FAILED" >> $GITHUB_STEP_SUMMARY
-          fi
+          echo "| Scan | Ergebnis |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|----------|" >> $GITHUB_STEP_SUMMARY
+
+          status() {
+            if [ "$1" == "success" ]; then echo "PASSED"; elif [ "$1" == "skipped" ]; then echo "SKIPPED"; else echo "FAILED"; fi
+          }
+
+          echo "| Python Security (pip-audit + bandit) | $(status '${{ needs.python-security.result }}') |" >> $GITHUB_STEP_SUMMARY
+          echo "| Secrets Scan (TruffleHog) | $(status '${{ needs.secrets-scan.result }}') |" >> $GITHUB_STEP_SUMMARY
+          echo "| Trivy Filesystem-Scan | $(status '${{ needs.trivy-fs.result }}') |" >> $GITHUB_STEP_SUMMARY
+          echo "| Trivy Config-Scan | $(status '${{ needs.trivy-config.result }}') |" >> $GITHUB_STEP_SUMMARY
+          echo "| npm audit | $(status '${{ needs.npm-audit.result }}') |" >> $GITHUB_STEP_SUMMARY
+          echo "| SBOM (CycloneDX) | $(status '${{ needs.sbom.result }}') |" >> $GITHUB_STEP_SUMMARY
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "_Trivy Image-Scan läuft nur wenn \`image-ref\` + \`docker-runner\` gesetzt sind (opt-in)._" >> $GITHUB_STEP_SUMMARY

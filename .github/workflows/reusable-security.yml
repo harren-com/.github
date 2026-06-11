@@ -70,7 +70,15 @@ jobs:
 
       - name: Install project dependencies
         run: |
-          for f in ${{ inputs.requirements-files }}; do pip install -r $f; done
+          # Datei-Guard: Nicht-Python-Repos (Shell/Terraform) haben keine requirements-Dateien —
+          # pip-audit scannt dann nur die (leere) Umgebung statt den Job rot zu machen.
+          for f in ${{ inputs.requirements-files }}; do
+            if [ -f "$f" ]; then
+              pip install -r "$f"
+            else
+              echo "Übersprungen: $f nicht vorhanden"
+            fi
+          done
 
       - name: Run pip-audit (CVE scanning)
         run: |
@@ -127,10 +135,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Trivy installieren (v0.63.0, kein Docker-Daemon nötig)
+      - name: Trivy installieren (v0.71.0, kein Docker-Daemon nötig)
         run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-            | sh -s -- -b /usr/local/bin v0.63.0
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/v0.71.0/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin v0.71.0
           trivy --version
 
       - name: Trivy fs-Scan — CRITICAL/HIGH-Gate
@@ -179,11 +187,11 @@ jobs:
             echo "Konfigurationsdateien gefunden: $FOUND (und ggf. weitere)"
           fi
 
-      - name: Trivy installieren (v0.63.0)
+      - name: Trivy installieren (v0.71.0)
         if: steps.detect.outputs.has_config == 'true'
         run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-            | sh -s -- -b /usr/local/bin v0.63.0
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/v0.71.0/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin v0.71.0
           trivy --version
 
       - name: Trivy config-Scan — CRITICAL/HIGH-Gate
@@ -273,10 +281,10 @@ jobs:
       - name: Docker-Login ghcr.io
         run: echo "${{ github.token }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
-      - name: Trivy installieren (v0.63.0)
+      - name: Trivy installieren (v0.71.0)
         run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-            | sh -s -- -b /usr/local/bin v0.63.0
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/v0.71.0/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin v0.71.0
           trivy --version
 
       - name: Trivy image-Scan — CRITICAL/HIGH-Gate
@@ -310,10 +318,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Trivy installieren (v0.63.0)
+      - name: Trivy installieren (v0.71.0)
         run: |
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh \
-            | sh -s -- -b /usr/local/bin v0.63.0
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/v0.71.0/contrib/install.sh \
+            | sh -s -- -b /usr/local/bin v0.71.0
           trivy --version
 
       - name: SBOM erzeugen (CycloneDX)

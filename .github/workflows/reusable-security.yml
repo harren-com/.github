@@ -37,6 +37,13 @@ on:
         type: string
         default: ''
 
+# Least-privilege Default-Token (F-024 / security-ops#22): alle Jobs sind read-only
+# (Scanner + Step-Summary-Writes brauchen keine Token-Schreibrechte). Explizit gesetzt,
+# damit der Workflow unabhängig vom Org-/Repo-Default (derzeit 'read') deterministisch
+# minimal bleibt — Defense-in-Depth gegen ein versehentliches Hochstufen des Defaults.
+permissions:
+  contents: read
+
 jobs:
   python-security:
     name: Python Security Scan

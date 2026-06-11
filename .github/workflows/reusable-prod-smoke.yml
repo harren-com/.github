@@ -66,6 +66,13 @@ on:
           Leer = MCP-Handshake-Schritt wird uebersprungen.
         type: string
         default: ''
+      mcp-bearer-token:
+        description: >-
+          Optionaler Bearer-Token fuer den MCP-Handshake-Probe. Noetig, wenn der
+          Prod-Transport auf 0.0.0.0 bindet (dann erzwingt der Server Auth und der
+          /mcp-Endpoint antwortet sonst mit 401). Leer = kein Authorization-Header.
+        type: string
+        default: ''
       container-env:
         description: >-
           Optionale, durch Zeilen getrennte ENV-Zuweisungen fuer den Container
@@ -201,6 +208,7 @@ jobs:
         env:
           HEALTH_PORT: ${{ inputs.health-port }}
           MCP_PATH: ${{ inputs.mcp-path }}
+          MCP_BEARER: ${{ inputs.mcp-bearer-token }}
         run: |
           set -euo pipefail
           # Echter MCP-Handshake: initialize-Request via JSON-RPC. Erwartet eine
@@ -212,9 +220,18 @@ jobs:
 
           REQ='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"ci-smoke","version":"1.0"}}}'
 
+          # Bindet der Prod-Transport auf 0.0.0.0, erzwingt der Server Auth -> der
+          # /mcp-Endpoint antwortet ohne Token mit 401. Header nur setzen, wenn
+          # ein Token uebergeben wurde (sonst bleibt der Probe header-frei).
+          AUTH_FLAGS=()
+          if [ -n "${MCP_BEARER}" ]; then
+            AUTH_FLAGS+=("-H" "Authorization: Bearer ${MCP_BEARER}")
+          fi
+
           RESP=$(curl -s --max-time 5 \
             -H 'Content-Type: application/json' \
             -H 'Accept: application/json, text/event-stream' \
+            "${AUTH_FLAGS[@]}" \
             -X POST "${URL}" -d "${REQ}" || true)
 
           echo "MCP-Antwort: ${RESP}"

@@ -342,7 +342,12 @@ jobs:
           # Der Default-Wert (40) steht hinten und gewinnt daher gegen einen Caller,
           # der --max-turns in claude-args setzt. Bewusstes Erhöhen: Input `max-turns`
           # überschreiben (z.B. max-turns: 60) — dieser Input ersetzt dann den Default.
-          claude_args: ${{ inputs.claude-args }} --max-turns ${{ inputs.max-turns }}
+          # --allowedTools "Bash(gh pr review:*)" wird ADDITIV angehängt (cloud-dev #326):
+          # Das Protokoll mandatiert `gh pr review` als Finale Pflicht-Aktion, aber
+          # Caller-Allowlists führen dieses Tool nicht → permission_denials_count:13 →
+          # kein REVIEW_VERDICT-Marker → Gate konservativ BLOCKED. Zentral erzwingen
+          # (claude-code-action mergt mehrere --allowedTools additiv, kein Caller-Update nötig).
+          claude_args: ${{ inputs.claude-args }} --allowedTools "Bash(gh pr review:*)" --max-turns ${{ inputs.max-turns }}
           show_full_output: ${{ inputs.show-full-output }}
           # Bypass flaky GitHub API permission-check (504 timeout from self-hosted K8s runner).
           # Owner-repos only — safe as long as this workflow is org-internal.
@@ -375,7 +380,10 @@ jobs:
           claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
           github_token: ${{ secrets.GITHUB_TOKEN }}
           prompt: ${{ env.FULL_PROMPT }}
-          claude_args: ${{ inputs.claude-args }} --max-turns ${{ inputs.max-turns }}
+          # --allowedTools "Bash(gh pr review:*)" zentral additiv erzwingen (cloud-dev #326):
+          # Protokoll mandatiert `gh pr review`, Caller-Allowlists führen es nicht →
+          # permission_denials → kein Marker → konservativ BLOCKED. Symmetrisch zum run_review-Step.
+          claude_args: ${{ inputs.claude-args }} --allowedTools "Bash(gh pr review:*)" --max-turns ${{ inputs.max-turns }}
           show_full_output: ${{ inputs.show-full-output }}
           allowed_non_write_users: ${{ inputs.allowed-non-write-users }}
 

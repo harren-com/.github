@@ -60,6 +60,14 @@ on:
           wirksame Weg, den Cap zu setzen/erhöhen, ist dieser Input `max-turns`.
         type: number
         default: 40
+    secrets:
+      # Explizit deklariert (F-023 / security-ops#21), damit Caller den Token
+      # gezielt durchreichen können statt `secrets: inherit` (das JEDES Repo-Secret
+      # an den Review-Job weitergibt). required: true — der Review-Loop kann ohne
+      # Modell-Token nicht laufen.
+      CLAUDE_CODE_OAUTH_TOKEN:
+        description: 'OAuth-Token für Claude-Modell-Calls (Anthropic).'
+        required: true
 
 # Least-privilege Default-Token (F-024 / security-ops#22). Der Review-Job nutzt den
 # GITHUB_TOKEN für: `gh pr review --approve/--request-changes` + Inline-Comments

@@ -61,15 +61,12 @@ on:
         type: number
         default: 40
 
-# Least-privilege Default-Token (F-024 / security-ops#22). Der Review-Job nutzt den
-# GITHUB_TOKEN für: `gh pr review --approve/--request-changes` + Inline-Comments
-# (pull-requests: write) und den persistenten Verdikt-Sticky als Issue-Comment
-# (issues: write); Checkout/Diff-Reads (contents: read). Mehr braucht er nicht.
-# Modell-Calls laufen über CLAUDE_CODE_OAUTH_TOKEN, nicht über GITHUB_TOKEN.
-permissions:
-  contents: read
-  pull-requests: write
-  issues: write
+# HINWEIS (F-024 / security-ops#22): KEIN Top-Level-`permissions:`-Block hier.
+# Ein Reusable kann nur Rechte EINSCHRÄNKEN, nicht erweitern — verlangt er mehr
+# als der Caller gewährt, bricht der Run mit startup_failure (passiert mit dem
+# zwischenzeitlichen #39-Block: Reusable forderte issues:write, Caller gewährten
+# nur issues:read → fleet-weiter claude-review-Ausfall). Least-privilege gehört
+# daher in die CALLER-Workflows; F-024 wird caller-seitig gelöst.
 
 jobs:
   claude-review:

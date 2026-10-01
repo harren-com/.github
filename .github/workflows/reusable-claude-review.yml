@@ -60,6 +60,19 @@ on:
           wirksame Weg, den Cap zu setzen/erhöhen, ist dieser Input `max-turns`.
         type: number
         default: 40
+      review-paths:
+        description: |
+          Optional (ibkr_to_datev#879 / .github#45): ERE (grep -E) der Pfade, die ein
+          Review erfordern. Default leer = IMMER reviewen (bisheriges Verhalten).
+          Gesetzt: berührt der PR keine passende Datei (Liste via pulls/N/files), überspringt
+          der Job alle Review-Steps und endet mit Erfolg ("docs/config-only, kein Review").
+          Zweck: Der Check `<caller-job> / claude-review` wird bei JEDEM PR am Head-SHA
+          gemeldet (Pflicht-Check für Merge-Gates), statt per `on.pull_request.paths` im
+          Caller gar nicht zu erscheinen. Der Caller darf dann KEIN `paths:` setzen.
+          Fail-safe: bei Fehlern der Datei-Abfrage wird voll reviewt.
+        type: string
+        required: false
+        default: ''
     secrets:
       # Explizit deklariert (F-023 / security-ops#21), damit Caller den Token
       # gezielt durchreichen können statt `secrets: inherit` (das JEDES Repo-Secret
@@ -106,12 +119,49 @@ jobs:
             echo "$HOME/.local/bin" >> $GITHUB_PATH
           fi
 
+      - name: Detect review scope (optional review-paths filter)
+        id: scope
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REVIEW_PATHS: ${{ inputs.review-paths }}
+        run: |
+          set -uo pipefail
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          if [ -z "$REVIEW_PATHS" ]; then
+            echo "review-paths nicht gesetzt — voller Review."
+            exit 0
+          fi
+          PR="${GITHUB_REF#refs/pull/}"
+          PR="${PR%/merge}"
+          if ! [[ "$PR" =~ ^[0-9]+$ ]]; then
+            echo "Keine PR-Nr aus GITHUB_REF=$GITHUB_REF ableitbar — voller Review."
+            exit 0
+          fi
+          if ! FILES="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/pulls/${PR}/files" --jq '.[].filename' 2>/dev/null)" \
+             || [ -z "$FILES" ]; then
+            echo "Dateiliste nicht abrufbar — fail-safe: voller Review."
+            exit 0
+          fi
+          if echo "$FILES" | grep -qE "$REVIEW_PATHS"; then
+            echo "PR berührt review-relevante Pfade — voller Review."
+            exit 0
+          fi
+          echo "skip=true" >> "$GITHUB_OUTPUT"
+          echo "docs/config-only, kein Review ($(echo "$FILES" | wc -l | tr -d ' ') Dateien, keine passt auf review-paths)."
+          {
+            echo "## Claude-Review"
+            echo ""
+            echo "docs/config-only, kein Review: keine geänderte Datei passt auf \`review-paths\`."
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Checkout repository
+        if: steps.scope.outputs.skip != 'true'
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Clean .claude/ symlinks (defensive — avoid ENOENT in action restore-step)
+        if: steps.scope.outputs.skip != 'true'
         # ARC scale-set runner pods can reuse the _work directory between jobs in the
         # same pod lifecycle. If a previous job left .claude/ symlinks pointing to absolute
         # paths from a developer machine (~/shared-claude-rules/...), the claude-code-action's
@@ -124,6 +174,7 @@ jobs:
           fi
 
       - name: Compose review prompt (protocol preamble + repo prompt)
+        if: steps.scope.outputs.skip != 'true'
         # Stellt dem repo-spezifischen Prompt die org-weite Review-Protokoll-Preamble
         # voran (Severity-Gating + erschöpfender erster Pass + state-aware Folge-Runden,
         # Issue #13). Single Source of Truth: ein Edit hier wirkt auf alle Org-Repos.
@@ -262,6 +313,7 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Reconcile stale bot inline comments
+        if: steps.scope.outputs.skip != 'true'
         # Inline-Comment-Reconciliation (Issue #15):
         # Das state-aware Review-Protokoll dedupliziert nur den Prosa-Sticky-Summary
         # über die Runden (siehe "Compose review prompt"-Step oben), NICHT die
@@ -319,6 +371,7 @@ jobs:
           echo "Inline-Comment-Reconciliation abgeschlossen."
 
       - name: Run Claude Code Review
+        if: steps.scope.outputs.skip != 'true'
         id: run_review
         # continue-on-error (Issue #68): Ein Fehlschlag der Action (Turn-Cap, Tool-/
         # Sandbox-Fehler) soll NICHT den Job hart rot machen, bevor der Merge-Gate
@@ -384,7 +437,7 @@ jobs:
         # env/with sind 1:1 identisch zum run_review-Step oben (derselbe Review).
         # Step-Timeout (Issue #30): ebenfalls von 10 auf 18 min angehoben (symmetrisch
         # zum run_review-Step).
-        if: steps.run_review.outcome == 'failure'
+        if: steps.scope.outputs.skip != 'true' && steps.run_review.outcome == 'failure'
         continue-on-error: true
         timeout-minutes: 18
         uses: anthropics/claude-code-action@v1
@@ -426,7 +479,7 @@ jobs:
         # UND Issue-Comments paginiert — der neue Issue-Comment wird von ihm
         # automatisch als Quelle miterfasst (nach Zeitstempel sortiert, jüngster
         # gewinnt). Keine Änderung am Gate nötig.
-        if: always()
+        if: always() && steps.scope.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
@@ -544,7 +597,7 @@ jobs:
         # Quelle ist derselbe REVIEW_VERDICT-Marker, den die Action vom Modell erzwingt.
         # Dieser Comment ist die persistente Audit-Quelle und überlebt jeden Reconcile
         # (der Reconcile filtert den Marker explizit aus, s. o.).
-        if: always()
+        if: always() && steps.scope.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -657,7 +710,7 @@ jobs:
         # Pre-Merge-Sichtbarkeit; die Hard-Enforcement-Lücke ist POST-HOC durch
         # review-gate-alert.yml (cloud-dev-environment #283) abgedeckt (Alert-Issue bei
         # Merge ohne grünen Review).
-        if: always()
+        if: always() && steps.scope.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |

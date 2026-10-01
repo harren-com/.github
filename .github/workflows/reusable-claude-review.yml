@@ -568,9 +568,24 @@ jobs:
             --jq '.[] | select(.user.login == "github-actions[bot]") | select(.body | contains("claude-review-verdict-sticky") | not) | "\(.created_at // "")\t\(.body // "" | gsub("\r";"") | gsub("\n";"\\n"))"' \
             >> /tmp/sticky-bodies.txt 2>/dev/null || true
 
-          MARKER_LINE="$(sort /tmp/sticky-bodies.txt \
+          MARKER_ENTRY="$(sort /tmp/sticky-bodies.txt \
+            | grep '<!-- REVIEW_VERDICT:' \
+            | tail -1 || true)"
+          MARKER_TS="${MARKER_ENTRY%%$'\t'*}"
+          MARKER_LINE="$(echo "$MARKER_ENTRY" \
             | grep -o '<!-- REVIEW_VERDICT:[^>]*-->' \
             | tail -1 || true)"
+
+          # Stale-Marker-Schutz (ibkr #809): identisch zum Gate-Step — eine neuere
+          # APPROVED-Review ohne Marker macht den älteren Marker ungültig.
+          LATEST_REVIEW="$(gh api --paginate "repos/${REPO}/pulls/${PR}/reviews" \
+            --jq '[.[] | select(.user.login == "github-actions[bot]")] | sort_by(.submitted_at // .created_at // "") | last | "\(.state // "")\t\(.submitted_at // .created_at // "")"' \
+            2>/dev/null | tail -1 || true)"
+          LATEST_STATE="${LATEST_REVIEW%%$'\t'*}"
+          LATEST_TS="${LATEST_REVIEW#*$'\t'}"
+          if [ -n "$MARKER_LINE" ] && [ "$LATEST_STATE" = "APPROVED" ] && [[ "$LATEST_TS" > "$MARKER_TS" ]]; then
+            MARKER_LINE='<!-- REVIEW_VERDICT: status=CLEAN blockers=0 warnings=0 round=? -->'
+          fi
 
           if [ -z "$MARKER_LINE" ]; then
             STATUS="UNBEKANNT"; BLOCKERS="?"; WARNINGS="?"; ROUND="?"
@@ -676,9 +691,28 @@ jobs:
           # Nach Zeitstempel sortieren (jüngste zuletzt), Zeilen mit Marker filtern,
           # letzte (= jüngste) nehmen. Der Body ist pro Zeile mit \n maskiert, der
           # Marker steht damit auf derselben Zeile wie sein Body.
-          MARKER_LINE="$(sort /tmp/gate-bodies.txt \
+          MARKER_ENTRY="$(sort /tmp/gate-bodies.txt \
+            | grep '<!-- REVIEW_VERDICT:' \
+            | tail -1 || true)"
+          MARKER_TS="${MARKER_ENTRY%%$'\t'*}"
+          MARKER_LINE="$(echo "$MARKER_ENTRY" \
             | grep -o '<!-- REVIEW_VERDICT:[^>]*-->' \
             | tail -1 || true)"
+
+          # Stale-Marker-Schutz (ibkr #809): Eine APPROVED-Review einer späteren Runde
+          # trägt nicht zwingend einen Marker. Ist die jüngste Bot-Review APPROVED und
+          # NEUER als der jüngste Marker, ist dieser Marker veraltet → CLEAN. Ein neuerer
+          # Marker (auch BLOCKED) gewinnt weiterhin, weil dann der Marker-Zeitstempel
+          # größer ist als der der Freigabe.
+          LATEST_REVIEW="$(gh api --paginate "repos/${REPO}/pulls/${PR}/reviews" \
+            --jq '[.[] | select(.user.login == "github-actions[bot]")] | sort_by(.submitted_at // .created_at // "") | last | "\(.state // "")\t\(.submitted_at // .created_at // "")"' \
+            2>/dev/null | tail -1 || true)"
+          LATEST_STATE="${LATEST_REVIEW%%$'\t'*}"
+          LATEST_TS="${LATEST_REVIEW#*$'\t'}"
+          if [ -n "$MARKER_LINE" ] && [ "$LATEST_STATE" = "APPROVED" ] && [[ "$LATEST_TS" > "$MARKER_TS" ]]; then
+            echo "Jüngste Bot-Review APPROVED (${LATEST_TS}) ist neuer als Marker (${MARKER_TS}) — Marker veraltet, werte CLEAN (ibkr #809)."
+            MARKER_LINE='<!-- REVIEW_VERDICT: status=CLEAN blockers=0 warnings=0 round=? -->'
+          fi
 
           if [ -z "$MARKER_LINE" ]; then
             # Additiver Fallback (Issue #68): Kein Marker im jüngsten Bot-Review/-Comment,

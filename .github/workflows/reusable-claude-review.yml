@@ -73,6 +73,18 @@ on:
         type: string
         required: false
         default: ''
+      domain-logic-paths:
+        description: |
+          Optional (.github#43): kommagetrennte Glob-Liste der Fachlogik-Pfade mit Steuer-,
+          Geld- oder Bilanzwirkung (z. B. "src/tax/**,src/ledger/**,src/export/**").
+          Default leer = KEIN Fachlogik-Block, Prompt unverändert (bisheriges Verhalten).
+          Gesetzt: der Review-Prompt wird um einen Block mit drei Fachfragen ergänzt, der
+          NUR greift, wenn der PR eine passende Datei ändert; ein geänderter Sollwert ohne
+          unabhängige Quelle ist dann ein [BLOCKER]. Kein eigener Job/Lauf, keine Wirkung
+          auf review-paths-Skip oder Merge-Gate-Logik.
+        type: string
+        required: false
+        default: ''
     secrets:
       # Explizit deklariert (F-023 / security-ops#21), damit Caller den Token
       # gezielt durchreichen können statt `secrets: inherit` (das JEDES Repo-Secret
@@ -183,6 +195,7 @@ jobs:
         env:
           REVIEW_PROTOCOL_INPUT: ${{ inputs.review-protocol }}
           REVIEW_PROMPT_INPUT: ${{ inputs.review-prompt }}
+          DOMAIN_LOGIC_PATHS_INPUT: ${{ inputs.domain-logic-paths }}
         run: |
           set -euo pipefail
 
@@ -309,6 +322,21 @@ jobs:
             echo "---"
             echo ""
             printf '%s\n' "$REVIEW_PROMPT_INPUT"
+            # Optionaler Fachlogik-Block (.github#43) — nur wenn der Caller Pfade setzt.
+            if [ -n "$DOMAIN_LOGIC_PATHS_INPUT" ]; then
+              echo ""
+              echo "---"
+              echo ""
+              echo "## Fachlogik-Prüfung (nur bei Fachlogik-PRs)"
+              echo "Fachlogik-Pfade (Glob, kommagetrennt): $DOMAIN_LOGIC_PATHS_INPUT"
+              echo "Ändert der PR mindestens eine Datei auf diesen Pfaden (inkl. zugehöriger Tests/Referenzfälle), beantworte im Summary kurz drei Fragen:"
+              echo "1. Welche fachliche Aussage ändert sich?"
+              echo "2. Welche Fälle (Tests/Referenzfälle) belegen sie?"
+              echo "3. Woher stammt der Sollwert, unabhängig vom Code (Norm, BMF, Bescheinigung, Steuerberater)?"
+              echo "Ein geänderter oder neuer Sollwert ohne Quelle im PR-Text oder Testkommentar ist ein [BLOCKER]."
+              echo "Ein Sollwert, der nur aus dem Code selbst abgeleitet ist, gilt als ohne Quelle."
+              echo "Berührt der PR keine dieser Pfade oder ändert keinen Sollwert, entfällt dieser Block ersatzlos (kein Finding, kein Hinweis)."
+            fi
             echo "__CLAUDE_PROMPT_EOF__"
           } >> "$GITHUB_ENV"
 

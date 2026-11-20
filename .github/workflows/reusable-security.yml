@@ -96,7 +96,14 @@ jobs:
               IGNORE_FLAGS="$IGNORE_FLAGS --ignore-vuln $vuln"
             done
           fi
-          pip-audit --desc $IGNORE_FLAGS
+          # Eigenes Cache-Verzeichnis: platformdirs >= 4.14.8 (20.11.2026) prüft beim
+          # Default-Cache (~/.cache) alle Pfad-Vorfahren und bricht mit
+          # "PermissionError: /home/runner, writable by another user" ab (ARC-Runner:
+          # group/world-writable /home/runner). Mit explizitem --cache-dir überspringt
+          # pip-audit platformdirs komplett (pip_audit/_cache.py _get_cache_dir).
+          # Ref: harren-com/cloud-dev-environment#681
+          PIP_AUDIT_CACHE="$(mktemp -d)"
+          pip-audit --desc --cache-dir "$PIP_AUDIT_CACHE" $IGNORE_FLAGS
           echo "::endgroup::"
 
       - name: Run bandit (security linter)
